@@ -73,8 +73,10 @@ enum Command {
         #[arg(long)]
         src_only: bool,
     },
-    /// Show per-repo git status and version mismatches
+    /// Show per-repo git status, branch, push state, and version mismatches
     Status,
+    /// Inventory all worktrees: dirty, unmerged, unpushed branches
+    Worktrees,
 
     // ── Cross-repo execution ──
     /// Run a shell command in every repo (dependency-ordered)
@@ -164,6 +166,7 @@ fn main() {
             src_only,
         } => publish::run_needs_publish(&root, &config, show_diffs, src_only),
         Command::Status => status::run(&root, &config),
+        Command::Worktrees => status::run_worktrees(&root, &config),
         Command::Run {
             cmd,
             filter,
