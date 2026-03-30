@@ -92,7 +92,7 @@ pub enum CiStrategy {
     Delete,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct CiCrateOverride {
     pub default_strategy: Option<CiStrategy>,
     #[serde(default)]
@@ -158,7 +158,23 @@ pub struct ReleaseConfig {
 }
 
 impl SuperworkConfig {
-    pub fn ci_strategy_for(&self, crate_name: &str, dep_name: &str) -> CiStrategy {
+    /// Get CI strategy for a dep, checking inline metadata first, then central config.
+    pub fn ci_strategy_for(
+        &self,
+        crate_name: &str,
+        dep_name: &str,
+        inline: Option<&CiCrateOverride>,
+    ) -> CiStrategy {
+        // Inline metadata takes priority
+        if let Some(ovr) = inline {
+            if ovr.delete.contains(&dep_name.to_string()) {
+                return CiStrategy::Delete;
+            }
+            if let Some(s) = ovr.default_strategy {
+                return s;
+            }
+        }
+        // Fall back to central config
         if let Some(ovr) = self.ci.overrides.get(crate_name) {
             if ovr.delete.contains(&dep_name.to_string()) {
                 return CiStrategy::Delete;
@@ -167,6 +183,19 @@ impl SuperworkConfig {
         } else {
             self.ci.default_strategy
         }
+    }
+
+    /// Get the merged CI override for a crate (inline + central, inline wins)
+    pub fn ci_override_for<'a>(
+        &'a self,
+        crate_name: &str,
+        inline: Option<&'a CiCrateOverride>,
+    ) -> Option<MergedCiOverride<'a>> {
+        let central = self.ci.overrides.get(crate_name);
+        if inline.is_none() && central.is_none() {
+            return None;
+        }
+        Some(MergedCiOverride { inline, central })
     }
 
     pub fn github_url_for(&self, repo_dir: &str) -> Option<String> {
@@ -215,6 +244,60 @@ impl SuperworkConfig {
             .commands
             .get(check_name)
             .map(|d| d.command().to_string())
+    }
+}
+
+/// Merged view of inline (per-repo) + central CI overrides
+pub struct MergedCiOverride<'a> {
+    pub inline: Option<&'a CiCrateOverride>,
+    pub central: Option<&'a CiCrateOverride>,
+}
+
+impl MergedCiOverride<'_> {
+    fn pick(&self) -> Option<&CiCrateOverride> {
+        self.inline.or(self.central)
+    }
+
+    pub fn delete_sections(&self) -> &[String] {
+        // Inline wins, fall back to central
+        if let Some(ovr) = self.inline {
+            if !ovr.delete_sections.is_empty() {
+                return &ovr.delete_sections;
+            }
+        }
+        self.central
+            .map(|c| c.delete_sections.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn delete_members(&self) -> &[String] {
+        self.pick()
+            .map(|o| o.delete_members.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn delete_workspace_deps(&self) -> &[String] {
+        self.pick()
+            .map(|o| o.delete_workspace_deps.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn delete_crate_deps(&self) -> &BTreeMap<String, Vec<String>> {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, Vec<String>>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        self.pick().map(|o| &o.delete_crate_deps).unwrap_or(&EMPTY)
+    }
+
+    pub fn strip_features(&self) -> &BTreeMap<String, Vec<String>> {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, Vec<String>>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        self.pick().map(|o| &o.strip_features).unwrap_or(&EMPTY)
+    }
+
+    pub fn blank_keys(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, BTreeMap<String, String>>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        self.pick().map(|o| &o.blank_keys).unwrap_or(&EMPTY)
     }
 }
 

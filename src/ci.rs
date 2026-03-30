@@ -1,4 +1,4 @@
-use crate::config::{CiStrategy, SuperworkConfig};
+use crate::config::{CiStrategy, MergedCiOverride, SuperworkConfig};
 use crate::discover::{self, DepSection, Ecosystem};
 use crate::manifest;
 use std::collections::BTreeMap;
@@ -59,10 +59,10 @@ pub fn run(
         }
 
         // If this crate is in a workspace, also apply workspace-level overrides
+        let inline_ci_ref = crate_info.inline_ci.as_ref();
         if let Some(ws_root) = &crate_info.workspace_root {
-            let ovr = config.ci.overrides.get(*crate_name);
-            if let Some(ovr) = ovr {
-                let n = apply_workspace_transforms(ws_root, ovr, dry_run)?;
+            if let Some(merged) = config.ci_override_for(crate_name, inline_ci_ref) {
+                let n = apply_workspace_transforms(ws_root, &merged, dry_run)?;
                 if n > 0 {
                     files_modified += 1;
                     changes += n;
@@ -71,12 +71,17 @@ pub fn run(
         }
 
         // Apply per-member-crate overrides (for workspaces like zenjpeg)
-        if let Some(ovr) = config.ci.overrides.get(*crate_name) {
-            for (member, member_deps) in &ovr.delete_crate_deps {
+        if let Some(merged) = config.ci_override_for(crate_name, inline_ci_ref) {
+            for (member, member_deps) in merged.delete_crate_deps() {
                 let member_manifest = find_member_manifest(ecosystem_root, crate_info, member)?;
                 if let Some(member_path) = member_manifest {
-                    let n =
-                        apply_member_transforms(&member_path, member, member_deps, ovr, dry_run)?;
+                    let n = apply_member_transforms(
+                        &member_path,
+                        member,
+                        member_deps,
+                        &merged,
+                        dry_run,
+                    )?;
                     if n > 0 {
                         files_modified += 1;
                         changes += n;
@@ -113,8 +118,13 @@ fn apply_ci_transforms(
         .filter(|d| d.from_crate == crate_name && d.manifest_path == manifest_path && d.has_path)
         .collect();
 
+    let inline_ci = eco
+        .crates
+        .get(crate_name)
+        .and_then(|c| c.inline_ci.as_ref());
+
     for dep in &deps {
-        let strategy = config.ci_strategy_for(crate_name, &dep.to_crate);
+        let strategy = config.ci_strategy_for(crate_name, &dep.to_crate, inline_ci);
         let section = dep_section_key(dep.section);
 
         match strategy {
@@ -154,9 +164,9 @@ fn apply_ci_transforms(
         }
     }
 
-    // Delete sections (e.g., patch.crates-io)
-    if let Some(ovr) = config.ci.overrides.get(crate_name) {
-        for section in &ovr.delete_sections {
+    // Delete sections (e.g., patch.crates-io) — check inline + central
+    if let Some(merged) = config.ci_override_for(crate_name, inline_ci) {
+        for section in merged.delete_sections() {
             if manifest::delete_section(&mut doc, section) {
                 changes += 1;
             }
@@ -177,19 +187,19 @@ fn apply_ci_transforms(
 /// Apply workspace-level transforms (member removal, workspace dep removal)
 fn apply_workspace_transforms(
     ws_root: &Path,
-    ovr: &crate::config::CiCrateOverride,
+    ovr: &MergedCiOverride<'_>,
     dry_run: bool,
 ) -> Result<usize, String> {
     let (_, mut doc) = manifest::read_manifest(ws_root)?;
     let mut changes = 0;
 
-    for member in &ovr.delete_members {
+    for member in ovr.delete_members() {
         if manifest::remove_workspace_member(&mut doc, member) {
             changes += 1;
         }
     }
 
-    for dep in &ovr.delete_workspace_deps {
+    for dep in ovr.delete_workspace_deps() {
         if manifest::remove_workspace_dep(&mut doc, dep) {
             changes += 1;
         }
@@ -211,7 +221,7 @@ fn apply_member_transforms(
     member_manifest: &Path,
     member_name: &str,
     delete_deps: &[String],
-    ovr: &crate::config::CiCrateOverride,
+    ovr: &MergedCiOverride<'_>,
     dry_run: bool,
 ) -> Result<usize, String> {
     let (_, mut doc) = manifest::read_manifest(member_manifest)?;
@@ -227,7 +237,7 @@ fn apply_member_transforms(
     }
 
     // Strip features
-    if let Some(features) = ovr.strip_features.get(member_name) {
+    if let Some(features) = ovr.strip_features().get(member_name) {
         for feature in features {
             // Strip from all deps' features arrays
             for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
@@ -246,7 +256,7 @@ fn apply_member_transforms(
     }
 
     // Blank keys
-    if let Some(blanks) = ovr.blank_keys.get(member_name) {
+    if let Some(blanks) = ovr.blank_keys().get(member_name) {
         for (key, value) in blanks {
             for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
                 if manifest::set_dep_value_raw(&mut doc, section, key, value) {

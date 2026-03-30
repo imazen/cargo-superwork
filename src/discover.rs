@@ -1,4 +1,4 @@
-use crate::config::SuperworkConfig;
+use crate::config::{CiCrateOverride, SuperworkConfig};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,10 @@ pub struct CrateInfo {
     pub github_url: Option<String>,
     /// If this crate is a workspace member, the workspace root Cargo.toml path
     pub workspace_root: Option<PathBuf>,
+    /// CI overrides from [package.metadata.superwork.ci] in this crate's Cargo.toml
+    pub inline_ci: Option<CiCrateOverride>,
+    /// Check overrides from [package.metadata.superwork.checks]
+    pub inline_checks: Option<BTreeMap<String, String>>,
 }
 
 /// Which section a dependency appears in
@@ -286,6 +290,45 @@ fn scan_single_crate(
 
     let _ = ecosystem_root; // used in repo_dir computation already
 
+    // Extract [package.metadata.superwork] if present
+    let superwork_meta = package
+        .get("metadata")
+        .and_then(|m| m.as_table())
+        .and_then(|m| m.get("superwork"))
+        .and_then(|s| s.as_table());
+
+    // Also check [workspace.metadata.superwork] for workspace roots
+    let ws_superwork_meta = if workspace_root.is_none() {
+        // This IS a workspace root (or standalone) — check workspace.metadata
+        doc.get("workspace")
+            .and_then(|w| w.as_table())
+            .and_then(|w| w.get("metadata"))
+            .and_then(|m| m.as_table())
+            .and_then(|m| m.get("superwork"))
+            .and_then(|s| s.as_table())
+    } else {
+        None
+    };
+
+    let meta = superwork_meta.or(ws_superwork_meta);
+
+    // Parse CI overrides from inline metadata
+    let inline_ci = meta.and_then(|m| m.get("ci")).and_then(|ci| {
+        // Serialize back to string, then deserialize as CiCrateOverride
+        let ci_str = toml::to_string(ci).ok()?;
+        toml::from_str::<CiCrateOverride>(&ci_str).ok()
+    });
+
+    // Parse check overrides
+    let inline_checks = meta
+        .and_then(|m| m.get("checks"))
+        .and_then(|c| c.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        });
+
     crates.insert(
         name.clone(),
         CrateInfo {
@@ -296,6 +339,8 @@ fn scan_single_crate(
             publishable,
             github_url,
             workspace_root: workspace_root.map(PathBuf::from),
+            inline_ci,
+            inline_checks,
         },
     );
 
