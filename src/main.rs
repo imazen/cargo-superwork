@@ -65,7 +65,14 @@ enum Command {
     /// Show topological publish order
     PublishOrder,
     /// Check which crates need publishing (compares local vs crates.io)
-    NeedsPublish,
+    NeedsPublish {
+        /// Show file-level diffs for changed crates
+        #[arg(long)]
+        show_diffs: bool,
+        /// Only count src/ changes as real changes (ignore docs, CI, tests)
+        #[arg(long)]
+        src_only: bool,
+    },
     /// Show per-repo git status and version mismatches
     Status,
 
@@ -152,7 +159,10 @@ fn main() {
         Command::Unpatch => patch::run_unpatch(&root, &config, cli.dry_run),
         Command::Bump { name, version } => bump::run(&root, &config, &name, &version, cli.dry_run),
         Command::PublishOrder => publish::run(&root, &config),
-        Command::NeedsPublish => publish::run_needs_publish(&root, &config),
+        Command::NeedsPublish {
+            show_diffs,
+            src_only,
+        } => publish::run_needs_publish(&root, &config, show_diffs, src_only),
         Command::Status => status::run(&root, &config),
         Command::Run {
             cmd,

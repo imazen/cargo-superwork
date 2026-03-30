@@ -1,7 +1,8 @@
 use crate::config::SuperworkConfig;
 use crate::discover::{self, CrateInfo};
 use crate::graph;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn run(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String> {
@@ -56,56 +57,73 @@ pub fn run(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String
 }
 
 /// Check which publishable crates need publishing.
-///
-/// For each publishable crate:
-/// 1. Query crates.io for the published version
-/// 2. Compare to local version
-/// 3. If versions match, check for source changes since the version tag
-pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String> {
+/// If `show_diffs` is true, shows the actual source diff for changed crates.
+/// If `src_only` is true, only counts changes under `src/` as real changes.
+pub fn run_needs_publish(
+    ecosystem_root: &Path,
+    config: &SuperworkConfig,
+    show_diffs: bool,
+    src_only: bool,
+) -> Result<(), String> {
     let eco = discover::scan_ecosystem(ecosystem_root, config)?;
 
     let publishable: Vec<&CrateInfo> = eco.crates.values().filter(|c| c.publishable).collect();
 
     println!(
-        "checking {} publishable crates against crates.io...",
+        "checking {} publishable crates against crates.io (parallel)...",
         publishable.len()
     );
-    println!();
 
-    let owned_orgs = config.owned_orgs();
+    let owned_orgs: Vec<String> = config.owned_orgs().iter().map(|s| s.to_string()).collect();
+
+    // Query crates.io in parallel
+    let crate_names: Vec<String> = publishable.iter().map(|c| c.name.clone()).collect();
+    let results = query_crates_io_parallel(&crate_names);
+
+    println!();
 
     let mut needs_publish: Vec<(String, String, String)> = Vec::new();
     let mut needs_bump: Vec<(String, String)> = Vec::new();
     let mut up_to_date = 0;
     let mut never_published: Vec<(String, String)> = Vec::new();
-    // (name, crates.io version, crates.io repo URL)
     let mut external_forks: Vec<(String, String, String)> = Vec::new();
 
-    for info in &publishable {
-        let crates_io = query_crates_io(&info.name);
+    // Build lookup for CrateInfo by name
+    let info_map: BTreeMap<&str, &CrateInfo> =
+        publishable.iter().map(|c| (c.name.as_str(), *c)).collect();
+    let owned_refs: Vec<&str> = owned_orgs.iter().map(|s| s.as_str()).collect();
+
+    for name in &crate_names {
+        let info = info_map[name.as_str()];
+        let crates_io = results.get(name).and_then(|r| r.as_ref());
 
         match crates_io {
             None => {
-                never_published.push((info.name.clone(), info.version.clone()));
+                never_published.push((name.clone(), info.version.clone()));
             }
             Some((pub_ver, repo_url)) => {
-                // Check if this crate is owned by us or is an external fork
-                if !is_owned_repo(&repo_url, &owned_orgs) {
-                    external_forks.push((info.name.clone(), pub_ver, repo_url));
+                if !is_owned_repo(repo_url, &owned_refs) {
+                    external_forks.push((name.clone(), pub_ver.clone(), repo_url.clone()));
                     continue;
                 }
 
-                if pub_ver != info.version {
-                    needs_publish.push((info.name.clone(), info.version.clone(), pub_ver));
+                if pub_ver != &info.version {
+                    needs_publish.push((name.clone(), info.version.clone(), pub_ver.clone()));
                 } else {
                     let tag = find_version_tag(info);
                     let has_changes = match &tag {
-                        Some(t) => has_source_changes_since_tag(info, t),
+                        Some(t) => {
+                            if src_only {
+                                has_src_changes_since_tag(info, t)
+                            } else {
+                                has_source_changes_since_tag(info, t)
+                            }
+                        }
                         None => true,
                     };
 
                     if has_changes {
-                        needs_bump.push((info.name.clone(), pub_ver));
+                        needs_bump.push((name.clone(), pub_ver.clone()));
                     } else {
                         up_to_date += 1;
                     }
@@ -119,6 +137,11 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
         println!("=== Ready to Publish (version bumped) ===");
         for (name, local, published) in &needs_publish {
             println!("  {name} {published} -> {local}");
+            if show_diffs {
+                if let Some(info) = info_map.get(name.as_str()) {
+                    show_crate_diff(info, Some(published), src_only);
+                }
+            }
         }
         println!();
     }
@@ -126,7 +149,15 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
     if !needs_bump.is_empty() {
         println!("=== Needs Version Bump (source changed, same version) ===");
         for (name, ver) in &needs_bump {
-            println!("  {name} {ver} (source changed since publish)");
+            println!("  {name} {ver}");
+            if show_diffs {
+                if let Some(info) = info_map.get(name.as_str()) {
+                    let tag = find_version_tag(info);
+                    if let Some(t) = &tag {
+                        show_crate_diff(info, Some(t), src_only);
+                    }
+                }
+            }
         }
         println!();
     }
@@ -147,8 +178,9 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
         println!();
     }
 
+    let src_label = if src_only { " (src/ only)" } else { "" };
     println!(
-        "=== Summary ===\n  {} ready to publish, {} need bump, {} up-to-date, {} never published, {} external forks",
+        "=== Summary{src_label} ===\n  {} ready to publish, {} need bump, {} up-to-date, {} never published, {} external forks",
         needs_publish.len(),
         needs_bump.len(),
         up_to_date,
@@ -158,6 +190,38 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
 
     let _ = ecosystem_root;
     Ok(())
+}
+
+/// Query crates.io for all crate names in parallel.
+/// Returns a map of crate_name -> Option<(version, repo_url)>.
+fn query_crates_io_parallel(names: &[String]) -> BTreeMap<String, Option<(String, String)>> {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let results: Arc<Mutex<BTreeMap<String, Option<(String, String)>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+
+    // Run up to 16 queries at a time
+    let chunk_size = 16;
+    for chunk in names.chunks(chunk_size) {
+        let handles: Vec<_> = chunk
+            .iter()
+            .map(|name| {
+                let name = name.clone();
+                let results = Arc::clone(&results);
+                thread::spawn(move || {
+                    let result = query_crates_io(&name);
+                    results.lock().unwrap().insert(name, result);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    Arc::try_unwrap(results).unwrap().into_inner().unwrap()
 }
 
 /// Query crates.io for version and repository URL.
@@ -275,9 +339,97 @@ fn has_source_changes_since_tag(info: &CrateInfo, tag: &str) -> bool {
         .current_dir(repo_dir)
         .output()
         .ok()
-        .map(|o| {
-            // If diff output is non-empty, there are changes
-            !o.stdout.is_empty()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(true)
+}
+
+/// Like has_source_changes_since_tag but only counts changes under src/.
+fn has_src_changes_since_tag(info: &CrateInfo, tag: &str) -> bool {
+    let (repo_dir, src_path) = crate_paths(info);
+    let range = format!("{tag}..HEAD");
+
+    Command::new("git")
+        .args(["diff", "--stat", &range, "--", &src_path])
+        .current_dir(&repo_dir)
+        .output()
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(true)
+}
+
+/// Show a condensed diff summary for a crate since a tag or published version.
+fn show_crate_diff(info: &CrateInfo, tag_or_ver: Option<&str>, src_only: bool) {
+    let (repo_dir, rel_prefix) = crate_paths(info);
+
+    let tag = tag_or_ver.and_then(|v| {
+        // If it looks like a version, try to find the tag
+        if v.starts_with('v') || v.contains('.') {
+            find_version_tag(info)
+        } else {
+            Some(v.to_string())
+        }
+    });
+
+    let Some(tag) = tag else {
+        println!("    (no tag found, cannot show diff)");
+        return;
+    };
+
+    let range = format!("{tag}..HEAD");
+    let path_arg = if src_only {
+        format!("{rel_prefix}src/")
+    } else {
+        rel_prefix
+    };
+
+    let output = Command::new("git")
+        .args(["diff", "--stat", &range, "--", &path_arg])
+        .current_dir(&repo_dir)
+        .output()
+        .ok();
+
+    if let Some(o) = output {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        if lines.is_empty() {
+            println!("    (no changes{})", if src_only { " in src/" } else { "" });
+        } else {
+            // Show file changes but limit to 10 lines + summary
+            for line in lines.iter().take(10) {
+                println!("    {line}");
+            }
+            if lines.len() > 10 {
+                // The last line is usually the summary
+                if let Some(last) = lines.last() {
+                    println!("    ...");
+                    println!("    {last}");
+                }
+            }
+        }
+    }
+}
+
+/// Get the repo directory and relative path prefix for a crate.
+fn crate_paths(info: &CrateInfo) -> (PathBuf, String) {
+    let crate_dir = info.manifest_path.parent().unwrap();
+    let repo_dir = if let Some(ws) = &info.workspace_root {
+        ws.parent().unwrap().to_path_buf()
+    } else {
+        crate_dir.to_path_buf()
+    };
+
+    let rel_prefix = crate_dir
+        .strip_prefix(&repo_dir)
+        .ok()
+        .and_then(|p| {
+            let s = p.to_string_lossy();
+            if s.is_empty() {
+                None
+            } else {
+                Some(format!("{s}/"))
+            }
         })
-        .unwrap_or(true) // Assume changed on error
+        .unwrap_or_default();
+
+    (repo_dir, rel_prefix)
 }
