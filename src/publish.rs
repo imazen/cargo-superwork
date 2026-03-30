@@ -72,35 +72,43 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
     );
     println!();
 
-    // (name, local_version, published_version)
+    let owned_orgs = config.owned_orgs();
+
     let mut needs_publish: Vec<(String, String, String)> = Vec::new();
-    // (name, published_version)
     let mut needs_bump: Vec<(String, String)> = Vec::new();
     let mut up_to_date = 0;
     let mut never_published: Vec<(String, String)> = Vec::new();
+    // (name, crates.io version, crates.io repo URL)
+    let mut external_forks: Vec<(String, String, String)> = Vec::new();
 
     for info in &publishable {
-        let published_version = query_crates_io_version(&info.name);
+        let crates_io = query_crates_io(&info.name);
 
-        match published_version {
+        match crates_io {
             None => {
                 never_published.push((info.name.clone(), info.version.clone()));
             }
-            Some(pub_ver) if pub_ver != info.version => {
-                needs_publish.push((info.name.clone(), info.version.clone(), pub_ver));
-            }
-            Some(pub_ver) => {
-                // Same version — check if source changed since tag
-                let tag = find_version_tag(info);
-                let has_changes = match &tag {
-                    Some(t) => has_source_changes_since_tag(info, t),
-                    None => true, // No tag found, assume changed
-                };
+            Some((pub_ver, repo_url)) => {
+                // Check if this crate is owned by us or is an external fork
+                if !is_owned_repo(&repo_url, &owned_orgs) {
+                    external_forks.push((info.name.clone(), pub_ver, repo_url));
+                    continue;
+                }
 
-                if has_changes {
-                    needs_bump.push((info.name.clone(), pub_ver));
+                if pub_ver != info.version {
+                    needs_publish.push((info.name.clone(), info.version.clone(), pub_ver));
                 } else {
-                    up_to_date += 1;
+                    let tag = find_version_tag(info);
+                    let has_changes = match &tag {
+                        Some(t) => has_source_changes_since_tag(info, t),
+                        None => true,
+                    };
+
+                    if has_changes {
+                        needs_bump.push((info.name.clone(), pub_ver));
+                    } else {
+                        up_to_date += 1;
+                    }
                 }
             }
         }
@@ -131,25 +139,33 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
         println!();
     }
 
+    if !external_forks.is_empty() {
+        println!("=== External Forks (use crates.io, don't publish) ===");
+        for (name, ver, repo) in &external_forks {
+            println!("  {name} {ver} ({repo})");
+        }
+        println!();
+    }
+
     println!(
-        "=== Summary ===\n  {} ready to publish, {} need bump, {} up-to-date, {} never published",
+        "=== Summary ===\n  {} ready to publish, {} need bump, {} up-to-date, {} never published, {} external forks",
         needs_publish.len(),
         needs_bump.len(),
         up_to_date,
-        never_published.len()
+        never_published.len(),
+        external_forks.len(),
     );
 
     let _ = ecosystem_root;
     Ok(())
 }
 
-/// Query crates.io for the latest published version of a crate.
-/// Returns None if the crate has never been published.
-fn query_crates_io_version(crate_name: &str) -> Option<String> {
-    // Use `cargo search` — scan results for exact name match.
-    // Output lines: `crate_name = "X.Y.Z"    # description`
+/// Query crates.io for version and repository URL.
+/// Returns (version, repo_url) or None if not published.
+fn query_crates_io(crate_name: &str) -> Option<(String, String)> {
+    // Use `cargo info` for full metadata (version + repository)
     let output = Command::new("cargo")
-        .args(["search", crate_name, "--limit", "25"])
+        .args(["info", crate_name])
         .output()
         .ok()?;
 
@@ -157,20 +173,39 @@ fn query_crates_io_version(crate_name: &str) -> Option<String> {
         return None;
     }
 
-    // The exact match must be `crate_name = "` at start of line (after trim)
-    // to distinguish `app` from `app-config`, `appy`, etc.
-    let exact_prefix = format!("{crate_name} = \"");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut version = None;
+    let mut repo = String::new();
+
     for line in stdout.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix(&exact_prefix) {
-            if let Some(end) = rest.find('"') {
-                return Some(rest[..end].to_string());
-            }
+        if let Some(v) = line.strip_prefix("version:") {
+            version = Some(v.trim().to_string());
+        } else if let Some(r) = line.strip_prefix("repository:") {
+            repo = r.trim().to_string();
         }
     }
-    None
+
+    version.map(|v| (v, repo))
+}
+
+/// Check if a crates.io repository URL belongs to one of our owned orgs.
+fn is_owned_repo(repo_url: &str, owned_orgs: &[&str]) -> bool {
+    if repo_url.is_empty() {
+        // No repo URL — can't determine ownership. Assume ours (conservative).
+        return true;
+    }
+    let url_lower = repo_url.to_lowercase();
+    for org in owned_orgs {
+        let org_lower = org.to_lowercase();
+        // Match github.com/org/ or github.com/org.git patterns
+        if url_lower.contains(&format!("github.com/{org_lower}/"))
+            || url_lower.contains(&format!("github.com/{org_lower}."))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Find the git tag for a crate's current version.

@@ -46,6 +46,12 @@ pub struct SuperworkspaceMeta {
     /// Additional directories to scan (relative to config file)
     #[serde(default)]
     pub extra_roots: Vec<String>,
+    /// GitHub orgs/users that own crates in this superworkspace.
+    /// Crates on crates.io whose `repository` URL doesn't match any of these
+    /// are considered external forks (use crates.io version, don't publish).
+    /// Defaults to [default_github_org].
+    #[serde(default)]
+    pub owned_orgs: Vec<String>,
 }
 
 fn default_org() -> String {
@@ -218,6 +224,16 @@ impl SuperworkConfig {
             self.meta().default_github_org,
             basename
         ))
+    }
+
+    /// Get the list of GitHub orgs/users that own crates in this superworkspace.
+    pub fn owned_orgs(&self) -> Vec<&str> {
+        let meta = self.meta();
+        if meta.owned_orgs.is_empty() {
+            vec![meta.default_github_org.as_str()]
+        } else {
+            meta.owned_orgs.iter().map(|s| s.as_str()).collect()
+        }
     }
 
     pub fn scan_roots(&self, superworkspace_root: &Path) -> Vec<PathBuf> {
