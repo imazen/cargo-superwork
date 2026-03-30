@@ -244,7 +244,11 @@ fn query_crates_io(crate_name: &str) -> Option<(String, String)> {
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(v) = line.strip_prefix("version:") {
-            version = Some(v.trim().to_string());
+            // Format: "0.6.5" or "0.6.5 (latest 0.7.1)"
+            // Take only the first token (the actual version)
+            let v = v.trim();
+            let v = v.split_whitespace().next().unwrap_or(v);
+            version = Some(v.to_string());
         } else if let Some(r) = line.strip_prefix("repository:") {
             repo = r.trim().to_string();
         }
@@ -272,32 +276,43 @@ fn is_owned_repo(repo_url: &str, owned_orgs: &[&str]) -> bool {
     false
 }
 
-/// Find the git tag for a crate's current version.
-/// Tries: v{version}, {name}-v{version}, {name}-{version}
+/// Find the git tag for a crate at a specific version.
+/// Tries (in order): {name}-v{ver}, v{ver}, {name}-{ver}
+/// Prefers the crate-prefixed tag since repos with multiple crates
+/// use prefixed tags (e.g., zensim-v0.2.4 vs zensim-regress-v0.2.3).
 fn find_version_tag(info: &CrateInfo) -> Option<String> {
-    let crate_dir = info.manifest_path.parent()?;
+    find_version_tag_for(info, &info.version)
+}
+
+fn find_version_tag_for(info: &CrateInfo, version: &str) -> Option<String> {
     let repo_dir = if let Some(ws) = &info.workspace_root {
         ws.parent()?
     } else {
-        crate_dir
+        info.manifest_path.parent()?
     };
 
+    // Prefer crate-prefixed tags (disambiguates in multi-crate repos)
     let candidates = [
-        format!("v{}", info.version),
-        format!("{}-v{}", info.name, info.version),
-        format!("{}-{}", info.name, info.version),
+        format!("{}-v{version}", info.name),
+        format!("v{version}"),
+        format!("{}-{version}", info.name),
     ];
 
     for tag in &candidates {
-        let ok = Command::new("git")
+        let result = Command::new("git")
             .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
             .current_dir(repo_dir)
-            .output()
-            .ok()
-            .is_some_and(|o| o.status.success());
+            .output();
 
-        if ok {
-            return Some(tag.clone());
+        match &result {
+            Ok(o) if o.status.success() => return Some(tag.clone()),
+            Ok(_) => {} // tag doesn't exist
+            Err(e) => {
+                eprintln!(
+                    "    warn: git rev-parse failed in {}: {e}",
+                    repo_dir.display()
+                );
+            }
         }
     }
 
@@ -362,11 +377,14 @@ fn show_crate_diff(info: &CrateInfo, tag_or_ver: Option<&str>, src_only: bool) {
     let (repo_dir, rel_prefix) = crate_paths(info);
 
     let tag = tag_or_ver.and_then(|v| {
-        // If it looks like a version, try to find the tag
-        if v.starts_with('v') || v.contains('.') {
-            find_version_tag(info)
-        } else {
+        // If it looks like a version string, resolve to a tag
+        if v.contains('.') {
+            find_version_tag_for(info, v)
+        } else if v.starts_with('v') || v.contains('-') {
+            // Already a tag name
             Some(v.to_string())
+        } else {
+            find_version_tag(info)
         }
     });
 
