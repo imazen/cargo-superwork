@@ -1,0 +1,21 @@
+[package]
+name = "cargo-zen"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Ecosystem dependency manager for multi-repo Rust workspaces"
+repository = "https://github.com/imazen/cargo-zen"
+
+[[bin]]
+name = "cargo-zen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
+toml_edit = "0.25.8"
+toml = { version = "0.8", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+semver = { version = "1.0.27", features = ["serde"] }
+walkdir = "2.5.0"
+petgraph = "0.8.3"
