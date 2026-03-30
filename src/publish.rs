@@ -146,8 +146,10 @@ pub fn run_needs_publish(ecosystem_root: &Path, config: &SuperworkConfig) -> Res
 /// Query crates.io for the latest published version of a crate.
 /// Returns None if the crate has never been published.
 fn query_crates_io_version(crate_name: &str) -> Option<String> {
+    // Use `cargo search` instead of `cargo info` — more reliable parsing
+    // Output: `crate_name = "X.Y.Z"    # description`
     let output = Command::new("cargo")
-        .args(["info", crate_name, "--format", "json"])
+        .args(["search", crate_name, "--limit", "1"])
         .output()
         .ok()?;
 
@@ -155,13 +157,20 @@ fn query_crates_io_version(crate_name: &str) -> Option<String> {
         return None;
     }
 
-    // cargo info outputs structured text; parse version from first line
-    // Format: "crate_name #tag1 #tag2\ndescription\nversion: X.Y.Z\n..."
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
+        // Match exact crate name: `zencodec = "0.1.11"    # ...`
         let line = line.trim();
-        if let Some(ver) = line.strip_prefix("version:") {
-            return Some(ver.trim().to_string());
+        if let Some(rest) = line.strip_prefix(crate_name) {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('"') {
+                    if let Some(end) = rest.find('"') {
+                        return Some(rest[..end].to_string());
+                    }
+                }
+            }
         }
     }
     None
