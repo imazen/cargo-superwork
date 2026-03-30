@@ -1,14 +1,14 @@
 [package]
-name = "cargo-zen"
+name = "cargo-superwork"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "Ecosystem dependency manager for multi-repo Rust workspaces"
-repository = "https://github.com/imazen/cargo-zen"
+description = "Multi-repo Rust workspace manager — CI prep, dependency graphs, coordinated releases"
+repository = "https://github.com/imazen/cargo-superwork"
 
 [[bin]]
-name = "cargo-zen"
+name = "cargo-superwork"
 path = "src/main.rs"
 
 [package.metadata.binstall]

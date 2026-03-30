@@ -1,4 +1,4 @@
-use crate::config::EcosystemConfig;
+use crate::config::SuperworkConfig;
 use crate::discover::{self, DepSection};
 use crate::manifest;
 use std::collections::BTreeMap;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub fn run(
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     crate_name: &str,
     new_version: &str,
     dry_run: bool,

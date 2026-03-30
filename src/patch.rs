@@ -1,4 +1,4 @@
-use crate::config::EcosystemConfig;
+use crate::config::SuperworkConfig;
 use crate::discover::{self, DepSection};
 use crate::manifest;
 use std::collections::BTreeMap;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// Add path overrides to all internal deps (dev mode)
 pub fn run_patch(
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     dry_run: bool,
 ) -> Result<(), String> {
     let eco = discover::scan_ecosystem(ecosystem_root, config)?;
@@ -71,7 +71,7 @@ pub fn run_patch(
 /// Remove path overrides from dual-specified deps (publish mode)
 pub fn run_unpatch(
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     dry_run: bool,
 ) -> Result<(), String> {
     let eco = discover::scan_ecosystem(ecosystem_root, config)?;

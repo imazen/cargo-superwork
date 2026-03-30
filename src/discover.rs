@@ -1,4 +1,4 @@
-use crate::config::EcosystemConfig;
+use crate::config::SuperworkConfig;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +68,7 @@ pub struct Ecosystem {
 /// Scan the ecosystem and build the crate registry
 pub fn scan_ecosystem(
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
 ) -> Result<Ecosystem, String> {
     let mut crates = BTreeMap::new();
 
@@ -131,7 +131,7 @@ fn scan_root_dir(
     scan_root: &Path,
     ecosystem_root: &Path,
     is_main_root: bool,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     crates: &mut BTreeMap<String, CrateInfo>,
 ) -> Result<(), String> {
     if !scan_root.is_dir() {
@@ -181,7 +181,7 @@ fn scan_root_dir(
 fn scan_repo_dir(
     repo_path: &Path,
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     crates: &mut BTreeMap<String, CrateInfo>,
 ) -> Result<(), String> {
     let cargo_toml = repo_path.join("Cargo.toml");
@@ -239,7 +239,7 @@ fn scan_single_crate(
     manifest_path: &Path,
     repo_dir: &str,
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     workspace_root: Option<&Path>,
     crates: &mut BTreeMap<String, CrateInfo>,
 ) -> Result<(), String> {
@@ -538,7 +538,7 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
 }
 
 /// Run the discover command
-pub fn run(ecosystem_root: &Path, config: &EcosystemConfig) -> Result<(), String> {
+pub fn run(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String> {
     let eco = scan_ecosystem(ecosystem_root, config)?;
 
     println!("Ecosystem root: {}", ecosystem_root.display());

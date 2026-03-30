@@ -1,4 +1,4 @@
-use crate::config::{CiStrategy, EcosystemConfig};
+use crate::config::{CiStrategy, SuperworkConfig};
 use crate::discover::{self, DepSection, Ecosystem};
 use crate::manifest;
 use std::collections::BTreeMap;
@@ -7,7 +7,7 @@ use std::path::Path;
 /// Run ci-prep: transform Cargo.toml files for CI
 pub fn run(
     ecosystem_root: &Path,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     filter_crate: Option<&str>,
     dry_run: bool,
 ) -> Result<(), String> {
@@ -100,7 +100,7 @@ fn apply_ci_transforms(
     manifest_path: &Path,
     crate_name: &str,
     eco: &Ecosystem,
-    config: &EcosystemConfig,
+    config: &SuperworkConfig,
     dry_run: bool,
 ) -> Result<usize, String> {
     let (_, mut doc) = manifest::read_manifest(manifest_path)?;
@@ -281,7 +281,7 @@ fn dep_section_key(section: DepSection) -> &'static str {
 }
 
 /// Get the git URL for a dependency crate
-fn dep_git_url(dep_name: &str, eco: &Ecosystem, config: &EcosystemConfig) -> Option<String> {
+fn dep_git_url(dep_name: &str, eco: &Ecosystem, config: &SuperworkConfig) -> Option<String> {
     // Look up the crate's repo and get its GitHub URL
     if let Some(info) = eco.crates.get(dep_name) {
         config.github_url_for(&info.repo_dir)
@@ -289,7 +289,8 @@ fn dep_git_url(dep_name: &str, eco: &Ecosystem, config: &EcosystemConfig) -> Opt
         // Fallback: assume default org
         Some(format!(
             "https://github.com/{}/{}",
-            config.ecosystem.default_github_org, dep_name
+            config.meta().default_github_org,
+            dep_name
         ))
     }
 }

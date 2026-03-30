@@ -1,10 +1,10 @@
-use crate::config::EcosystemConfig;
+use crate::config::SuperworkConfig;
 use crate::discover;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-pub fn run(ecosystem_root: &Path, config: &EcosystemConfig) -> Result<(), String> {
+pub fn run(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String> {
     let eco = discover::scan_ecosystem(ecosystem_root, config)?;
 
     // Group crates by repo dir
