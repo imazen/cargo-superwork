@@ -64,6 +64,8 @@ enum Command {
     },
     /// Show topological publish order
     PublishOrder,
+    /// Check which crates need publishing (compares local vs crates.io)
+    NeedsPublish,
     /// Show per-repo git status and version mismatches
     Status,
 
@@ -150,6 +152,7 @@ fn main() {
         Command::Unpatch => patch::run_unpatch(&root, &config, cli.dry_run),
         Command::Bump { name, version } => bump::run(&root, &config, &name, &version, cli.dry_run),
         Command::PublishOrder => publish::run(&root, &config),
+        Command::NeedsPublish => publish::run_needs_publish(&root, &config),
         Command::Status => status::run(&root, &config),
         Command::Run {
             cmd,
