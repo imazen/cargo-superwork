@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod audit;
 mod bump;
 mod check;
 mod ci;
@@ -9,6 +10,7 @@ mod graph;
 mod manifest;
 mod patch;
 mod publish;
+mod readme_links;
 mod run;
 mod status;
 
@@ -77,6 +79,14 @@ enum Command {
     Status,
     /// Inventory all worktrees: dirty, unmerged, unpushed branches
     Worktrees,
+    /// Generate "Image tech I maintain" ecosystem links section for READMEs
+    ReadmeLinks {
+        /// Crate to generate links for (highlights it in the table)
+        #[arg(long)]
+        crate_name: Option<String>,
+    },
+    /// Run health checks from work-maintenance (edition, license, badges, clutter, docs)
+    Audit,
 
     // ── Cross-repo execution ──
     /// Run a shell command in every repo (dependency-ordered)
@@ -167,6 +177,10 @@ fn main() {
         } => publish::run_needs_publish(&root, &config, show_diffs, src_only),
         Command::Status => status::run(&root, &config),
         Command::Worktrees => status::run_worktrees(&root, &config),
+        Command::ReadmeLinks { crate_name } => {
+            readme_links::run(&root, &config, crate_name.as_deref())
+        }
+        Command::Audit => audit::run(&root, &config),
         Command::Run {
             cmd,
             filter,
