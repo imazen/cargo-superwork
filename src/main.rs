@@ -5,6 +5,7 @@ mod bump;
 mod check;
 mod ci;
 mod config;
+mod dashboard;
 mod discover;
 mod graph;
 mod manifest;
@@ -79,6 +80,8 @@ enum Command {
     Status,
     /// Inventory all worktrees: dirty, unmerged, unpushed branches
     Worktrees,
+    /// Unified dashboard: branch, CI, dirty, unpushed in one table
+    Dashboard,
     /// Generate "Image tech I maintain" ecosystem links section for READMEs
     ReadmeLinks {
         /// Crate to generate links for (highlights it in the table)
@@ -185,6 +188,7 @@ fn main() {
         } => publish::run_needs_publish(&root, &config, show_diffs, src_only),
         Command::Status => status::run(&root, &config),
         Command::Worktrees => status::run_worktrees(&root, &config),
+        Command::Dashboard => dashboard::run(&root, &config),
         Command::ReadmeLinks { crate_name } => {
             readme_links::run(&root, &config, crate_name.as_deref())
         }
