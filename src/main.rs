@@ -138,6 +138,14 @@ enum Command {
         /// Crate to test reverse deps for
         name: String,
     },
+    /// Check for outdated dependencies across all repos (requires cargo-outdated)
+    Outdated {
+        #[arg(long)]
+        filter: Option<String>,
+        /// Show all transitive deps, not just direct (depth=1)
+        #[arg(long)]
+        deep: bool,
+    },
 }
 
 fn main() {
@@ -221,6 +229,9 @@ fn main() {
         }
         Command::SemverCheck { filter } => run::run_semver_check(&root, &config, filter.as_deref()),
         Command::Copter { name } => run::run_copter(&root, &config, &name),
+        Command::Outdated { filter, deep } => {
+            run::run_outdated(&root, &config, filter.as_deref(), deep)
+        }
     };
 
     if let Err(e) = result {

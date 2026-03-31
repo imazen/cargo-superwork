@@ -4,6 +4,7 @@ use crate::graph;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 /// Run an arbitrary command in every repo, ordered by dependency graph.
 pub fn run_cmd(
@@ -343,6 +344,158 @@ pub fn run_copter(root: &Path, config: &SuperworkConfig, crate_name: &str) -> Re
     } else {
         Err(format!("cargo-copter failed (exit {})", output.code))
     }
+}
+
+/// Run `cargo outdated` across all repos in parallel and aggregate results.
+pub fn run_outdated(
+    root: &Path,
+    config: &SuperworkConfig,
+    filter: Option<&str>,
+    deep: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let repos = select_repos(&eco, config, filter, false, root)?;
+
+    if repos.is_empty() {
+        println!("no repos to check");
+        return Ok(());
+    }
+
+    // Collect unique (repo_dir, repo_path) pairs
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut repo_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for (repo_dir, crates) in &repos {
+        if seen.insert(repo_dir.clone()) {
+            let path = if let Some(first) = crates.first() {
+                if let Some(ws) = &first.workspace_root {
+                    ws.parent().unwrap_or(ws).to_path_buf()
+                } else {
+                    first.manifest_path.parent().unwrap().to_path_buf()
+                }
+            } else {
+                root.join(repo_dir)
+            };
+            repo_paths.push((repo_dir.clone(), path));
+        }
+    }
+
+    println!("checking {} repos for outdated deps...", repo_paths.len());
+
+    // Run in parallel
+    let results: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let chunk_size = 8;
+    for chunk in repo_paths.chunks(chunk_size) {
+        use std::thread;
+        let handles: Vec<_> = chunk
+            .iter()
+            .map(|(repo_dir, path)| {
+                let repo_dir = repo_dir.clone();
+                let path = path.clone();
+                let results = Arc::clone(&results);
+                let errors = Arc::clone(&errors);
+                thread::spawn(move || {
+                    let mut args = vec!["outdated", "--workspace"];
+                    if !deep {
+                        args.extend(["--depth", "1"]);
+                    }
+                    let output = Command::new("cargo")
+                        .args(&args)
+                        .current_dir(&path)
+                        .output();
+
+                    match output {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            // Parse lines: keep only actual dep lines (4+ whitespace-separated tokens
+                            // where the 2nd token contains a dot — i.e. a version string).
+                            // This filters out: headers (Name/----), workspace crate name lines,
+                            // separator (====), and "All dependencies up to date" messages.
+                            let outdated: Vec<String> = stdout
+                                .lines()
+                                .filter(|l| {
+                                    let tokens: Vec<&str> =
+                                        l.split_whitespace().collect();
+                                    tokens.len() >= 4
+                                        && tokens[1].contains('.')
+                                        && tokens[1]
+                                            .chars()
+                                            .next()
+                                            .is_some_and(|c| c.is_ascii_digit())
+                                })
+                                .map(|l| l.to_string())
+                                .collect();
+                            if !outdated.is_empty() {
+                                results.lock().unwrap().push((repo_dir, outdated));
+                            }
+                        }
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{repo_dir}: {e}"));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    let mut results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    let errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
+
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    println!();
+    let total_outdated: usize = results.iter().map(|(_, deps)| deps.len()).sum();
+
+    if results.is_empty() {
+        println!("all deps up to date");
+    } else {
+        // Column widths
+        let repo_w = results.iter().map(|(r, _)| r.len()).max().unwrap_or(10).max(4) + 2;
+        // Parse each line into columns for alignment
+        println!(
+            "{:<repo_w$}  {:<30} {:<15} {:<15} {}",
+            "Repo", "Name", "Current", "Latest", "Kind"
+        );
+        println!("{}", "-".repeat(repo_w + 75));
+        for (repo_dir, lines) in &results {
+            for line in lines {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens.len() >= 5 {
+                    let (name, cur, latest, kind) =
+                        (tokens[0], tokens[1], tokens[3], tokens[4]);
+                    println!(
+                        "{:<repo_w$}  {:<30} {:<15} {:<15} {}",
+                        repo_dir, name, cur, latest, kind
+                    );
+                } else {
+                    println!("{:<repo_w$}  {}", repo_dir, line);
+                }
+            }
+        }
+        println!();
+        println!(
+            "{} outdated deps across {} repos",
+            total_outdated,
+            results.len()
+        );
+    }
+
+    if !errors.is_empty() {
+        println!();
+        println!("errors:");
+        for e in &errors {
+            println!("  {e}");
+        }
+    }
+
+    Ok(())
 }
 
 // ── Internal helpers ──
