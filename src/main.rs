@@ -4,6 +4,7 @@ mod audit;
 mod bump;
 mod check;
 mod ci;
+mod ci_lint;
 mod config;
 mod dashboard;
 mod discover;
@@ -90,6 +91,18 @@ enum Command {
     },
     /// Run health checks from work-maintenance (edition, license, badges, clutter, docs)
     Audit,
+    /// Lint CI readiness: detect deps that will break after ci-prep transformation
+    CiLint {
+        /// Only check repos matching this crate name glob
+        #[arg(long)]
+        filter: Option<String>,
+        /// Query crates.io to verify published versions (slower but more accurate)
+        #[arg(long)]
+        online: bool,
+        /// Show passing deps too (default: only warn/error/info)
+        #[arg(long)]
+        verbose: bool,
+    },
 
     // ── Cross-repo execution ──
     /// Run a shell command in every repo (dependency-ordered)
@@ -193,6 +206,11 @@ fn main() {
             readme_links::run(&root, &config, crate_name.as_deref())
         }
         Command::Audit => audit::run(&root, &config),
+        Command::CiLint {
+            filter,
+            online,
+            verbose,
+        } => ci_lint::run(&root, &config, filter.as_deref(), online, verbose),
         Command::Run {
             cmd,
             filter,

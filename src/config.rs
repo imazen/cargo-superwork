@@ -100,7 +100,11 @@ pub enum CiStrategy {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct CiCrateOverride {
+    #[serde(alias = "strategy")]
     pub default_strategy: Option<CiStrategy>,
+    /// Deps that should use git_url strategy even when default is strip_path
+    #[serde(default)]
+    pub git_url_override: Vec<String>,
     #[serde(default)]
     pub delete: Vec<String>,
     #[serde(default)]
@@ -175,6 +179,9 @@ impl SuperworkConfig {
         if let Some(ovr) = inline {
             if ovr.delete.contains(&dep_name.to_string()) {
                 return CiStrategy::Delete;
+            }
+            if ovr.git_url_override.contains(&dep_name.to_string()) {
+                return CiStrategy::GitUrl;
             }
             if let Some(s) = ovr.default_strategy {
                 return s;
