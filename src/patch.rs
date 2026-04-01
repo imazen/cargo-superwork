@@ -34,12 +34,21 @@ pub fn run_patch(
                 None => continue,
             };
 
+            // Skip git deps — adding path alongside git is rejected by Cargo
+            let section = dep_section_key(dep.section);
+            if dep_has_git(&doc, section, &dep.to_crate) {
+                eprintln!(
+                    "  skip: {} -> {} has git dep (use --replace-git to override)",
+                    dep.from_crate, dep.to_crate
+                );
+                continue;
+            }
+
             // Compute relative path from this manifest to the target's Cargo.toml parent
             let from_dir = manifest_path.parent().unwrap();
             let to_dir = target.manifest_path.parent().unwrap();
             let rel_path = compute_relative_path(from_dir, to_dir);
 
-            let section = dep_section_key(dep.section);
             if manifest::set_dep_path(&mut doc, section, &dep.to_crate, &rel_path) {
                 file_changes += 1;
             }
@@ -143,6 +152,23 @@ pub fn run_unpatch(
     }
 
     Ok(())
+}
+
+/// Check if a dependency entry has a `git` key
+fn dep_has_git(doc: &toml_edit::DocumentMut, section: &str, dep_name: &str) -> bool {
+    let Some(deps) = doc.get(section).and_then(|s| s.as_table_like()) else {
+        return false;
+    };
+    let Some(dep) = deps.get(dep_name) else {
+        return false;
+    };
+    if let Some(tbl) = dep.as_inline_table() {
+        return tbl.contains_key("git");
+    }
+    if let Some(tbl) = dep.as_table() {
+        return tbl.contains_key("git");
+    }
+    false
 }
 
 fn dep_section_key(section: DepSection) -> &'static str {
