@@ -291,7 +291,11 @@ fn dep_section_key(section: DepSection) -> &'static str {
 }
 
 /// Get the git URL for a dependency crate
-pub(crate) fn dep_git_url(dep_name: &str, eco: &Ecosystem, config: &SuperworkConfig) -> Option<String> {
+pub(crate) fn dep_git_url(
+    dep_name: &str,
+    eco: &Ecosystem,
+    config: &SuperworkConfig,
+) -> Option<String> {
     // Look up the crate's repo and get its GitHub URL
     if let Some(info) = eco.crates.get(dep_name) {
         config.github_url_for(&info.repo_dir)

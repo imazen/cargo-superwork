@@ -415,8 +415,7 @@ pub fn run_outdated(
                             let outdated: Vec<String> = stdout
                                 .lines()
                                 .filter(|l| {
-                                    let tokens: Vec<&str> =
-                                        l.split_whitespace().collect();
+                                    let tokens: Vec<&str> = l.split_whitespace().collect();
                                     tokens.len() >= 4
                                         && tokens[1].contains('.')
                                         && tokens[1]
@@ -431,10 +430,7 @@ pub fn run_outdated(
                             }
                         }
                         Err(e) => {
-                            errors
-                                .lock()
-                                .unwrap()
-                                .push(format!("{repo_dir}: {e}"));
+                            errors.lock().unwrap().push(format!("{repo_dir}: {e}"));
                         }
                     }
                 })
@@ -457,7 +453,13 @@ pub fn run_outdated(
         println!("all deps up to date");
     } else {
         // Column widths
-        let repo_w = results.iter().map(|(r, _)| r.len()).max().unwrap_or(10).max(4) + 2;
+        let repo_w = results
+            .iter()
+            .map(|(r, _)| r.len())
+            .max()
+            .unwrap_or(10)
+            .max(4)
+            + 2;
         // Parse each line into columns for alignment
         println!(
             "{:<repo_w$}  {:<30} {:<15} {:<15} {}",
@@ -468,8 +470,7 @@ pub fn run_outdated(
             for line in lines {
                 let tokens: Vec<&str> = line.split_whitespace().collect();
                 if tokens.len() >= 5 {
-                    let (name, cur, latest, kind) =
-                        (tokens[0], tokens[1], tokens[3], tokens[4]);
+                    let (name, cur, latest, kind) = (tokens[0], tokens[1], tokens[3], tokens[4]);
                     println!(
                         "{:<repo_w$}  {:<30} {:<15} {:<15} {}",
                         repo_dir, name, cur, latest, kind

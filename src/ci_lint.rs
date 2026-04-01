@@ -98,10 +98,7 @@ fn build_report(
             continue; // Only path deps get transformed by ci-prep
         }
         if let Some(info) = eco.crates.get(&dep.from_crate) {
-            by_repo
-                .entry(info.repo_dir.clone())
-                .or_default()
-                .push(dep);
+            by_repo.entry(info.repo_dir.clone()).or_default().push(dep);
         }
     }
 
@@ -164,7 +161,9 @@ fn build_report(
                 section: DepSection::Dependencies,
                 strategy: CiStrategy::GitUrl,
                 severity: Severity::Warn,
-                message: "[patch.crates-io] exists but not in delete_sections — will break CI resolution".into(),
+                message:
+                    "[patch.crates-io] exists but not in delete_sections — will break CI resolution"
+                        .into(),
             });
         }
 
@@ -285,29 +284,23 @@ fn classify_strip_path(
     // Online mode: check crates.io
     if !published.is_empty() {
         match published.get(to_crate) {
-            Some(Some(pub_ver)) => {
-                match check_version_match(version_req_str, pub_ver) {
-                    Ok(true) => (
-                        Severity::Pass,
-                        format!("version \"{version_req_str}\" resolves on crates.io ({pub_ver})"),
-                    ),
-                    Ok(false) => (
-                        Severity::Error,
-                        format!(
-                            "version \"{version_req_str}\" doesn't match crates.io {pub_ver}"
-                        ),
-                    ),
-                    Err(_) => (
-                        Severity::Warn,
-                        format!("couldn't parse version req \"{version_req_str}\""),
-                    ),
-                }
-            }
+            Some(Some(pub_ver)) => match check_version_match(version_req_str, pub_ver) {
+                Ok(true) => (
+                    Severity::Pass,
+                    format!("version \"{version_req_str}\" resolves on crates.io ({pub_ver})"),
+                ),
+                Ok(false) => (
+                    Severity::Error,
+                    format!("version \"{version_req_str}\" doesn't match crates.io {pub_ver}"),
+                ),
+                Err(_) => (
+                    Severity::Warn,
+                    format!("couldn't parse version req \"{version_req_str}\""),
+                ),
+            },
             Some(None) | None => (
                 Severity::Error,
-                format!(
-                    "'{to_crate}' not published on crates.io — strip_path will fail"
-                ),
+                format!("'{to_crate}' not published on crates.io — strip_path will fail"),
             ),
         }
     } else {
@@ -460,14 +453,20 @@ fn print_report(report: &LintReport, verbose: bool, online: bool) -> usize {
     let mut total_pass = 0;
 
     for repo in &report.repos {
-        let has_visible = repo.findings.iter().any(|f| {
-            verbose || f.severity != Severity::Pass
-        }) || !repo.sed_hacks.is_empty()
+        let has_visible = repo
+            .findings
+            .iter()
+            .any(|f| verbose || f.severity != Severity::Pass)
+            || !repo.sed_hacks.is_empty()
             || (repo.has_ci_config && !repo.uses_ci_prep);
 
         if !has_visible {
             // Count passes even if not printed
-            total_pass += repo.findings.iter().filter(|f| f.severity == Severity::Pass).count();
+            total_pass += repo
+                .findings
+                .iter()
+                .filter(|f| f.severity == Severity::Pass)
+                .count();
             continue;
         }
 
@@ -503,12 +502,7 @@ fn print_report(report: &LintReport, verbose: bool, online: bool) -> usize {
                 };
                 println!(
                     "  {}  {}  {} -> {}{}  {}",
-                    f.severity,
-                    strategy_label,
-                    f.from_crate,
-                    f.to_crate,
-                    section_suffix,
-                    f.message,
+                    f.severity, strategy_label, f.from_crate, f.to_crate, section_suffix, f.message,
                 );
             }
         }

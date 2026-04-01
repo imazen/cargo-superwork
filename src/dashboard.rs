@@ -9,7 +9,7 @@ use std::thread;
 struct RepoRow {
     repo_dir: String,
     branch: String,
-    ci: String,      // "ok", "fail", "no_runs", "?", "-" (no github)
+    ci: String, // "ok", "fail", "no_runs", "?", "-" (no github)
     dirty: usize,
     unpushed: usize,
     worktrees: usize,
@@ -67,8 +67,7 @@ pub fn run(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
             })
             .collect();
 
-        let results: Arc<Mutex<BTreeMap<String, String>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        let results: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         for chunk in pairs.chunks(16) {
             let handles: Vec<_> = chunk
@@ -106,8 +105,20 @@ pub fn run(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
     });
 
     // Column widths
-    let repo_w = rows.iter().map(|r| r.repo_dir.len()).max().unwrap_or(4).max(4) + 1;
-    let branch_w = rows.iter().map(|r| r.branch.len()).max().unwrap_or(6).max(6) + 1;
+    let repo_w = rows
+        .iter()
+        .map(|r| r.repo_dir.len())
+        .max()
+        .unwrap_or(4)
+        .max(4)
+        + 1;
+    let branch_w = rows
+        .iter()
+        .map(|r| r.branch.len())
+        .max()
+        .unwrap_or(6)
+        .max(6)
+        + 1;
 
     // Header
     println!(
