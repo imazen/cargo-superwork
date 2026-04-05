@@ -14,6 +14,7 @@ mod manifest;
 mod patch;
 mod publish;
 mod readme_links;
+mod release;
 mod run;
 mod status;
 
@@ -163,6 +164,11 @@ enum Command {
         #[arg(long)]
         deep: bool,
     },
+    /// Release orchestration: init, analyze, categorize, check, publish
+    Release {
+        #[command(subcommand)]
+        command: release::ReleaseCommand,
+    },
     /// Add version specs to path-only internal deps (makes them dual-specified for publish)
     FixDualSpec {
         /// Only fix deps from crates matching this glob
@@ -264,6 +270,7 @@ fn main() {
         Command::Outdated { filter, deep } => {
             run::run_outdated(&root, &config, filter.as_deref(), deep)
         }
+        Command::Release { command } => release::run(&root, &config, &command, cli.dry_run),
         Command::FixDualSpec { filter, target } => fix_dual_spec::run(
             &root,
             &config,
