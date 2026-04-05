@@ -1,4 +1,4 @@
-use crate::config::{CiCrateOverride, SuperworkConfig};
+use crate::config::{CiCrateOverride, CrateClass, SuperworkConfig};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,8 @@ pub struct CrateInfo {
     pub inline_ci: Option<CiCrateOverride>,
     /// Check overrides from [package.metadata.superwork.checks]
     pub inline_checks: Option<BTreeMap<String, String>>,
+    /// Release classification (library, binary, abi)
+    pub class: CrateClass,
 }
 
 /// Which section a dependency appears in
@@ -47,8 +49,10 @@ impl std::fmt::Display for DepSection {
 pub struct InternalDep {
     /// The crate that has the dependency
     pub from_crate: String,
-    /// The dependency crate name
+    /// The dependency crate name (resolved from `package` rename if present)
     pub to_crate: String,
+    /// The key name as written in the TOML (may differ from to_crate when `package` is used)
+    pub dep_key: String,
     pub section: DepSection,
     pub has_version: bool,
     pub has_path: bool,
@@ -329,6 +333,23 @@ fn scan_single_crate(
                 .collect()
         });
 
+    // Determine crate class: config override > heuristic
+    let class = if let Some(c) = config.release.crate_class.get(&name) {
+        *c
+    } else if name.ends_with("_abi") || name.ends_with("-ffi") || name.ends_with("_ffi") {
+        CrateClass::Abi
+    } else {
+        // Check if binary-only: has [[bin]] but no [lib]
+        let has_bin = doc.get("bin").and_then(|b| b.as_array()).is_some_and(|a| !a.is_empty());
+        let has_lib = doc.get("lib").is_some()
+            || manifest_path.parent().is_some_and(|p| p.join("src/lib.rs").exists());
+        if has_bin && !has_lib {
+            CrateClass::Binary
+        } else {
+            CrateClass::Library
+        }
+    };
+
     crates.insert(
         name.clone(),
         CrateInfo {
@@ -341,6 +362,7 @@ fn scan_single_crate(
             workspace_root: workspace_root.map(PathBuf::from),
             inline_ci,
             inline_checks,
+            class,
         },
     );
 
@@ -436,6 +458,7 @@ fn scan_deps_in_manifest(
                             deps.push(InternalDep {
                                 from_crate: crate_name.to_string(),
                                 to_crate: ws_actual_name.to_string(),
+                                dep_key: dep_name.clone(),
                                 section: *section,
                                 has_version: ws_has_version,
                                 has_path: ws_has_path,
@@ -452,6 +475,7 @@ fn scan_deps_in_manifest(
                 deps.push(InternalDep {
                     from_crate: crate_name.to_string(),
                     to_crate: actual_name.to_string(),
+                    dep_key: dep_name.clone(),
                     section: *section,
                     has_version,
                     has_path,

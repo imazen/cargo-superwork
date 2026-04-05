@@ -8,6 +8,7 @@ mod ci_lint;
 mod config;
 mod dashboard;
 mod discover;
+mod fix_dual_spec;
 mod graph;
 mod manifest;
 mod patch;
@@ -162,6 +163,15 @@ enum Command {
         #[arg(long)]
         deep: bool,
     },
+    /// Add version specs to path-only internal deps (makes them dual-specified for publish)
+    FixDualSpec {
+        /// Only fix deps from crates matching this glob
+        #[arg(long)]
+        filter: Option<String>,
+        /// Only fix deps targeting this specific crate
+        #[arg(long)]
+        target: Option<String>,
+    },
 }
 
 fn main() {
@@ -254,6 +264,13 @@ fn main() {
         Command::Outdated { filter, deep } => {
             run::run_outdated(&root, &config, filter.as_deref(), deep)
         }
+        Command::FixDualSpec { filter, target } => fix_dual_spec::run(
+            &root,
+            &config,
+            filter.as_deref(),
+            target.as_deref(),
+            cli.dry_run,
+        ),
     };
 
     if let Err(e) = result {

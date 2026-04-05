@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -160,11 +160,53 @@ impl CheckDef {
     }
 }
 
+/// Classification of a crate's release semantics
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrateClass {
+    /// Full semver analysis + coordinated release
+    #[default]
+    Library,
+    /// Independently versioned, no semver-checks needed (CLI tools, etc.)
+    Binary,
+    /// Independently versioned, ABI stability matters (FFI crates like imageflow_abi)
+    Abi,
+}
+
+impl std::fmt::Display for CrateClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Library => write!(f, "library"),
+            Self::Binary => write!(f, "binary"),
+            Self::Abi => write!(f, "abi"),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ReleaseConfig {
     /// Checks to run before publishing
     #[serde(default)]
     pub pre_publish: Vec<String>,
+    /// Override crate classification (library/binary/abi)
+    #[serde(default)]
+    pub crate_class: BTreeMap<String, CrateClass>,
+    /// Per-crate CI job failure allowlist (crate name → list of job name globs)
+    #[serde(default)]
+    pub ci_allow_failures: BTreeMap<String, Vec<String>>,
+    /// Global CI job failure allowlist (job name globs)
+    #[serde(default)]
+    pub ci_allow_failures_global: Vec<String>,
+    /// Cross-compilation targets for local testing (e.g., "i686-unknown-linux-gnu")
+    #[serde(default)]
+    pub local_targets: Vec<String>,
+    /// Seconds to wait for crates.io index propagation after publish (default: 30)
+    #[serde(default = "default_index_wait")]
+    pub index_wait_secs: u64,
+}
+
+fn default_index_wait() -> u64 {
+    30
 }
 
 impl SuperworkConfig {
