@@ -579,9 +579,9 @@ fn select_repos<'a>(
 }
 
 /// Order repos by dependency level (leaves first)
-fn order_repos_by_level<'a>(
+fn order_repos_by_level(
     eco: &Ecosystem,
-    repos: &[(String, Vec<&'a CrateInfo>)],
+    repos: &[(String, Vec<&CrateInfo>)],
 ) -> Result<Vec<Vec<(String, std::path::PathBuf)>>, String> {
     let levels = graph::publish_order(eco, false)?;
 
@@ -605,13 +605,8 @@ fn order_repos_by_level<'a>(
                         .parent()
                         .unwrap_or(info.manifest_path.parent().unwrap());
                     // Use the repo root, not the crate subdir
-                    let actual_repo_path = if info.workspace_root.is_some() {
-                        info.workspace_root
-                            .as_ref()
-                            .unwrap()
-                            .parent()
-                            .unwrap()
-                            .to_path_buf()
+                    let actual_repo_path = if let Some(ws_root) = &info.workspace_root {
+                        ws_root.parent().unwrap().to_path_buf()
                     } else {
                         info.manifest_path.parent().unwrap().to_path_buf()
                     };
