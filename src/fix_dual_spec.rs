@@ -179,8 +179,8 @@ fn is_dep_workspace_inherited(
 ) -> Result<bool, String> {
     let content = std::fs::read_to_string(manifest_path)
         .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
-    let doc: toml::Value =
-        toml::from_str(&content).map_err(|e| format!("parsing {}: {e}", manifest_path.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .map_err(|e| format!("parsing {}: {e}", manifest_path.display()))?;
 
     let result = doc
         .get(section)

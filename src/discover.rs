@@ -340,9 +340,14 @@ fn scan_single_crate(
         CrateClass::Abi
     } else {
         // Check if binary-only: has [[bin]] but no [lib]
-        let has_bin = doc.get("bin").and_then(|b| b.as_array()).is_some_and(|a| !a.is_empty());
+        let has_bin = doc
+            .get("bin")
+            .and_then(|b| b.as_array())
+            .is_some_and(|a| !a.is_empty());
         let has_lib = doc.get("lib").is_some()
-            || manifest_path.parent().is_some_and(|p| p.join("src/lib.rs").exists());
+            || manifest_path
+                .parent()
+                .is_some_and(|p| p.join("src/lib.rs").exists());
         if has_bin && !has_lib {
             CrateClass::Binary
         } else {
