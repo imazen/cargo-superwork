@@ -122,8 +122,8 @@ pub fn run(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
 
     // Header
     println!(
-        "{:<repo_w$}  {:<branch_w$}  {:<6}  {:<5}  {:<7}  {}",
-        "Repo", "Branch", "CI", "Dirty", "Unpush", "Crates"
+        "{:<repo_w$}  {:<branch_w$}  {:<6}  {:<5}  {:<7}  Crates",
+        "Repo", "Branch", "CI", "Dirty", "Unpush"
     );
     println!("{}", "-".repeat(repo_w + branch_w + 36));
 

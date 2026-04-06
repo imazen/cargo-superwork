@@ -382,6 +382,7 @@ pub fn run_outdated(
     println!("checking {} repos for outdated deps...", repo_paths.len());
 
     // Run in parallel
+    #[allow(clippy::type_complexity)]
     let results: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -462,8 +463,8 @@ pub fn run_outdated(
             + 2;
         // Parse each line into columns for alignment
         println!(
-            "{:<repo_w$}  {:<30} {:<15} {:<15} {}",
-            "Repo", "Name", "Current", "Latest", "Kind"
+            "{:<repo_w$}  {:<30} {:<15} {:<15} Kind",
+            "Repo", "Name", "Current", "Latest"
         );
         println!("{}", "-".repeat(repo_w + 75));
         for (repo_dir, lines) in &results {
@@ -598,7 +599,7 @@ fn order_repos_by_level(
             if let Some(info) = eco.crates.get(crate_name) {
                 if repo_set.contains(info.repo_dir.as_str()) && !seen_repos.contains(&info.repo_dir)
                 {
-                    let repo_path = info
+                    let _repo_path = info
                         .manifest_path
                         .parent()
                         .unwrap()

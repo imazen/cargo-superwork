@@ -135,6 +135,7 @@ pub struct ChecksConfig {
 /// A check can be a simple string command or a detailed definition
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 pub enum CheckDef {
     Simple(String),
     Detailed {
@@ -184,6 +185,7 @@ impl std::fmt::Display for CrateClass {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
 pub struct ReleaseConfig {
     /// Checks to run before publishing
     #[serde(default)]

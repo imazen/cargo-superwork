@@ -198,6 +198,7 @@ fn query_crates_io_parallel(names: &[String]) -> BTreeMap<String, Option<(String
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    #[allow(clippy::type_complexity)]
     let results: Arc<Mutex<BTreeMap<String, Option<(String, String)>>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
 

@@ -244,6 +244,7 @@ pub fn run(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
 }
 
 /// Check CI status and fetch open issues for all repos in parallel.
+#[allow(clippy::type_complexity)]
 fn check_github_parallel(
     repos: &[String],
 ) -> (

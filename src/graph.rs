@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 /// Build a dependency graph from the ecosystem.
 /// Returns (graph, node_index_by_crate_name).
+#[allow(dead_code)]
 pub fn build_graph(eco: &Ecosystem) -> (DiGraph<String, ()>, BTreeMap<String, NodeIndex>) {
     let mut graph = DiGraph::new();
     let mut indices: BTreeMap<String, NodeIndex> = BTreeMap::new();

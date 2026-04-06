@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 /// A crate discovered in the ecosystem
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CrateInfo {
     pub name: String,
     pub version: String,
@@ -26,6 +27,7 @@ pub struct CrateInfo {
 
 /// Which section a dependency appears in
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DepSection {
     Dependencies,
     DevDependencies,
@@ -67,6 +69,7 @@ pub struct InternalDep {
 
 /// Complete ecosystem state
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Ecosystem {
     pub root: PathBuf,
     pub crates: BTreeMap<String, CrateInfo>,

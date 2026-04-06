@@ -289,10 +289,21 @@ fn main() {
 fn find_config() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
+        // Check for Superwork.toml directly
         for name in ["Superwork.toml", "zen-ecosystem.toml"] {
             let candidate = dir.join(name);
             if candidate.exists() {
                 return Some(candidate);
+            }
+        }
+        // Check for pointer file (.superwork-root contains relative path to Superwork.toml)
+        let pointer = dir.join(".superwork-root");
+        if pointer.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pointer) {
+                let target = dir.join(content.trim());
+                if target.exists() {
+                    return Some(target);
+                }
             }
         }
         if !dir.pop() {

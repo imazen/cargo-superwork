@@ -45,6 +45,49 @@ pub enum ReleaseCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Run cargo semver-checks (and optionally copter) for a tier
+    Check {
+        /// Tier to check
+        #[arg(long)]
+        tier: Option<usize>,
+        /// Also run cargo-copter for crates with dependents
+        #[arg(long)]
+        copter: bool,
+    },
+    /// Run local tests: native, cross targets, clippy, fmt
+    LocalTest {
+        /// Tier to test
+        #[arg(long)]
+        tier: Option<usize>,
+        /// Specific cross target (e.g., i686-unknown-linux-gnu)
+        #[arg(long)]
+        target: Option<String>,
+        /// Only run clippy + fmt (skip cargo test)
+        #[arg(long)]
+        lint_only: bool,
+    },
+    /// Apply version bumps from categorization decisions
+    Bump {
+        /// Tier to bump
+        #[arg(long)]
+        tier: Option<usize>,
+    },
+    /// Create git tags and GitHub releases for a tier
+    Tag {
+        /// Tier to tag
+        tier: usize,
+    },
+    /// Check CI status for a tier, applying allowlist
+    CiStatus {
+        /// Tier to check
+        #[arg(long)]
+        tier: Option<usize>,
+    },
+    /// Publish crates for a tier (requires tags + CI passed)
+    Publish {
+        /// Tier to publish
+        tier: usize,
+    },
     /// Show full release status table
     Status,
     /// Suggest what AI should do next
@@ -69,6 +112,16 @@ pub fn run(
             bump,
             reason,
         } => run_categorize(root, config, name, category, bump, reason.as_deref()),
+        ReleaseCommand::Check { tier, copter } => run_check(root, config, *tier, *copter),
+        ReleaseCommand::LocalTest {
+            tier,
+            target,
+            lint_only,
+        } => run_local_test(root, config, *tier, target.as_deref(), *lint_only),
+        ReleaseCommand::Bump { tier } => run_bump(root, config, *tier, dry_run),
+        ReleaseCommand::Tag { tier } => run_tag(root, config, *tier, dry_run),
+        ReleaseCommand::CiStatus { tier } => run_ci_status(root, config, *tier),
+        ReleaseCommand::Publish { tier } => run_publish(root, config, *tier, dry_run),
         ReleaseCommand::Status => run_status(root, config),
         ReleaseCommand::Next => run_next(root, config),
     }
@@ -513,6 +566,599 @@ fn run_next(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
     Ok(())
 }
 
+// ── Phase 3: Check + Local Test ──
+
+fn run_check(
+    root: &Path,
+    config: &SuperworkConfig,
+    tier_filter: Option<usize>,
+    run_copter: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+
+    let mut checked = 0;
+    let mut breaking = 0;
+    let mut copter_pass = 0;
+    let mut copter_fail = 0;
+
+    for (level_idx, level) in levels.iter().enumerate() {
+        if let Some(t) = tier_filter {
+            if level_idx != t {
+                continue;
+            }
+        }
+
+        for name in level {
+            let Some(ca) = analyses.get(name.as_str()) else {
+                continue;
+            };
+            if ca.bump == "skip" || ca.category == "skip" {
+                continue;
+            }
+
+            let info = &eco.crates[name];
+
+            // Semver-checks for Library crates only
+            if info.class == CrateClass::Library {
+                let crate_dir = info.manifest_path.parent().unwrap();
+                let repo_dir = if let Some(ws) = &info.workspace_root {
+                    ws.parent().unwrap()
+                } else {
+                    crate_dir
+                };
+
+                print!("  semver-check {name}... ");
+                let output = Command::new("cargo")
+                    .args(["semver-checks"])
+                    .current_dir(repo_dir)
+                    .output();
+
+                let result = match &output {
+                    Ok(o) if o.status.success() => {
+                        println!("pass");
+                        "pass".to_string()
+                    }
+                    Ok(o) if o.status.code() == Some(1) => {
+                        println!("BREAKING");
+                        breaking += 1;
+                        "breaking".to_string()
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        println!("error: {}", stderr.lines().next().unwrap_or("unknown"));
+                        format!("error: {}", stderr.lines().next().unwrap_or(""))
+                    }
+                    Err(e) => {
+                        println!("error: {e}");
+                        format!("error: {e}")
+                    }
+                };
+
+                update_analysis_field(root, info, |a| a.semver_check = result)?;
+                checked += 1;
+            }
+
+            // Copter for crates with dependents
+            if run_copter && ca.dependents > 0 {
+                print!("  copter {name} ({} dependents)... ", ca.dependents);
+
+                // Find reverse dep directories
+                let rev_deps: Vec<PathBuf> = eco
+                    .deps
+                    .iter()
+                    .filter(|d| d.to_crate == *name)
+                    .filter_map(|d| {
+                        eco.crates
+                            .get(&d.from_crate)
+                            .map(|c| c.manifest_path.parent().unwrap().to_path_buf())
+                    })
+                    .collect();
+
+                if rev_deps.is_empty() {
+                    println!("skipped (no local reverse deps)");
+                    update_analysis_field(root, info, |a| {
+                        a.copter = "skipped".to_string();
+                    })?;
+                } else {
+                    let crate_dir = info.manifest_path.parent().unwrap();
+                    let mut args = vec![
+                        "copter".to_string(),
+                        "-p".to_string(),
+                        crate_dir.to_string_lossy().to_string(),
+                        "--only-check".to_string(),
+                        "--simple".to_string(),
+                    ];
+                    for rd in &rev_deps {
+                        args.push("--dependent-paths".to_string());
+                        args.push(rd.to_string_lossy().to_string());
+                    }
+
+                    let output = Command::new("cargo").args(&args).current_dir(root).output();
+
+                    let result = match &output {
+                        Ok(o) if o.status.success() => {
+                            println!("pass");
+                            copter_pass += 1;
+                            "pass".to_string()
+                        }
+                        Ok(_) => {
+                            println!("FAIL");
+                            copter_fail += 1;
+                            "fail".to_string()
+                        }
+                        Err(e) => {
+                            println!("error: {e}");
+                            format!("error: {e}")
+                        }
+                    };
+
+                    update_analysis_field(root, info, |a| a.copter = result)?;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("Semver: {checked} checked, {breaking} breaking");
+    if run_copter {
+        println!("Copter: {copter_pass} pass, {copter_fail} fail");
+    }
+    Ok(())
+}
+
+fn run_local_test(
+    root: &Path,
+    config: &SuperworkConfig,
+    tier_filter: Option<usize>,
+    target: Option<&str>,
+    lint_only: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+
+    // Determine targets: explicit, from config, or just native
+    let cross_targets: Vec<&str> = if let Some(t) = target {
+        vec![t]
+    } else {
+        config
+            .release
+            .local_targets
+            .iter()
+            .map(|s| s.as_str())
+            .collect()
+    };
+
+    let mut pass = 0;
+    let mut fail = 0;
+
+    for (level_idx, level) in levels.iter().enumerate() {
+        if let Some(t) = tier_filter {
+            if level_idx != t {
+                continue;
+            }
+        }
+
+        // Group by repo to avoid running tests multiple times per repo
+        let mut tier_repos: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for name in level {
+            let Some(ca) = analyses.get(name.as_str()) else {
+                continue;
+            };
+            if ca.bump == "skip" || ca.category == "skip" {
+                continue;
+            }
+            let info = &eco.crates[name];
+            tier_repos.entry(&info.repo_dir).or_default().push(name);
+        }
+
+        for (repo_dir, crate_names) in &tier_repos {
+            let repo_path = resolve_repo_path(root, repo_dir);
+            println!("=== {repo_dir} ({}) ===", crate_names.join(", "));
+
+            // Clippy
+            print!("  clippy... ");
+            if run_cmd_ok(
+                &repo_path,
+                "cargo",
+                &["clippy", "--all-targets", "--", "-D", "warnings"],
+            ) {
+                println!("pass");
+            } else {
+                println!("FAIL");
+                fail += 1;
+            }
+
+            // Fmt
+            print!("  fmt... ");
+            if run_cmd_ok(&repo_path, "cargo", &["fmt", "--", "--check"]) {
+                println!("pass");
+            } else {
+                println!("FAIL");
+                fail += 1;
+            }
+
+            if lint_only {
+                pass += 1;
+                continue;
+            }
+
+            // Native test
+            print!("  test (native)... ");
+            if run_cmd_ok(&repo_path, "cargo", &["test"]) {
+                println!("pass");
+                pass += 1;
+            } else {
+                println!("FAIL");
+                fail += 1;
+            }
+
+            // Cross targets
+            for target in &cross_targets {
+                print!("  test ({target})... ");
+                if run_cmd_ok(&repo_path, "cross", &["test", "--target", target]) {
+                    println!("pass");
+                } else {
+                    println!("FAIL");
+                    fail += 1;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("{pass} repos passed, {fail} failures");
+    Ok(())
+}
+
+// ── Phase 4: Bump, Tag, CI Status, Publish ──
+
+fn run_bump(
+    root: &Path,
+    config: &SuperworkConfig,
+    tier_filter: Option<usize>,
+    dry_run: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+
+    let mut bumped = 0;
+
+    for (level_idx, level) in levels.iter().enumerate() {
+        if let Some(t) = tier_filter {
+            if level_idx != t {
+                continue;
+            }
+        }
+
+        for name in level {
+            let Some(ca) = analyses.get(name.as_str()) else {
+                continue;
+            };
+            if ca.bump == "skip" || ca.category == "skip" || ca.bump.is_empty() {
+                continue;
+            }
+
+            let info = &eco.crates[name];
+            let current = semver::Version::parse(&info.version)
+                .map_err(|e| format!("{name}: bad version '{}': {e}", info.version))?;
+
+            let new_version = match ca.bump.as_str() {
+                "major" => format!("{}.0.0", current.major + 1),
+                "minor" => format!("{}.{}.0", current.major, current.minor + 1),
+                "patch" => format!("{}.{}.{}", current.major, current.minor, current.patch + 1),
+                other => return Err(format!("{name}: invalid bump level '{other}'")),
+            };
+
+            let label = if dry_run { "[dry-run] " } else { "" };
+            println!(
+                "{label}{name}: {} → {new_version} ({} {})",
+                info.version, ca.category, ca.bump
+            );
+
+            if !dry_run {
+                crate::bump::run(root, config, name, &new_version, false)?;
+            }
+            bumped += 1;
+        }
+    }
+
+    let label = if dry_run { "[dry-run] " } else { "" };
+    println!("{label}Bumped {bumped} crates");
+    Ok(())
+}
+
+fn run_tag(
+    root: &Path,
+    config: &SuperworkConfig,
+    tier: usize,
+    dry_run: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+
+    let level = levels
+        .get(tier)
+        .ok_or_else(|| format!("tier {tier} does not exist (max: {})", levels.len() - 1))?;
+
+    let mut tagged = 0;
+
+    for name in level {
+        let Some(ca) = analyses.get(name.as_str()) else {
+            continue;
+        };
+        if ca.bump == "skip" || ca.category == "skip" {
+            continue;
+        }
+
+        let info = &eco.crates[name];
+        let repo_path = resolve_repo_path(root, &info.repo_dir);
+        let tag = format!("{}-v{}", info.name, info.version);
+
+        let label = if dry_run { "[dry-run] " } else { "" };
+
+        // Check if tag already exists
+        if git_output(
+            &repo_path,
+            &["rev-parse", "--verify", &format!("refs/tags/{tag}")],
+        )
+        .is_some()
+        {
+            println!("{label}{name}: tag {tag} already exists, skipping");
+            continue;
+        }
+
+        println!("{label}{name}: creating tag {tag}");
+
+        if !dry_run {
+            // Create tag
+            let status = Command::new("git")
+                .args(["tag", &tag])
+                .current_dir(&repo_path)
+                .status()
+                .map_err(|e| format!("git tag {tag}: {e}"))?;
+            if !status.success() {
+                return Err(format!("git tag {tag} failed"));
+            }
+
+            // Push tag
+            let status = Command::new("git")
+                .args(["push", "origin", &tag])
+                .current_dir(&repo_path)
+                .status()
+                .map_err(|e| format!("git push origin {tag}: {e}"))?;
+            if !status.success() {
+                return Err(format!("git push origin {tag} failed"));
+            }
+
+            // Create GitHub release
+            let gh_repo = config
+                .github_url_for(&info.repo_dir)
+                .and_then(|url| url.strip_prefix("https://github.com/").map(String::from));
+
+            if let Some(repo_slug) = gh_repo {
+                let status = Command::new("gh")
+                    .args([
+                        "release",
+                        "create",
+                        &tag,
+                        "--repo",
+                        &repo_slug,
+                        "--title",
+                        &tag,
+                        "--generate-notes",
+                    ])
+                    .current_dir(&repo_path)
+                    .status()
+                    .map_err(|e| format!("gh release create {tag}: {e}"))?;
+                if !status.success() {
+                    eprintln!("  warning: gh release create {tag} failed (tag was pushed)");
+                }
+            }
+        }
+
+        tagged += 1;
+    }
+
+    let label = if dry_run { "[dry-run] " } else { "" };
+    println!("{label}Tagged {tagged} crates in tier {tier}");
+    Ok(())
+}
+
+fn run_ci_status(
+    root: &Path,
+    config: &SuperworkConfig,
+    tier_filter: Option<usize>,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+
+    let global_allowlist = &config.release.ci_allow_failures_global;
+
+    for (level_idx, level) in levels.iter().enumerate() {
+        if let Some(t) = tier_filter {
+            if level_idx != t {
+                continue;
+            }
+        }
+
+        // Group by repo
+        let mut tier_repos: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for name in level {
+            let Some(ca) = analyses.get(name.as_str()) else {
+                continue;
+            };
+            if ca.bump == "skip" || ca.category == "skip" {
+                continue;
+            }
+            let info = &eco.crates[name];
+            tier_repos.entry(&info.repo_dir).or_default().push(name);
+        }
+
+        if tier_repos.is_empty() {
+            continue;
+        }
+
+        println!("=== Tier {level_idx} CI Status ===");
+
+        for (repo_dir, crate_names) in &tier_repos {
+            let gh_url = config.github_url_for(repo_dir);
+            let repo_slug = gh_url
+                .as_ref()
+                .and_then(|url| url.strip_prefix("https://github.com/"));
+
+            let Some(slug) = repo_slug else {
+                println!("  {repo_dir}: no GitHub URL configured");
+                continue;
+            };
+
+            // Get latest run status
+            let output = Command::new("gh")
+                .args([
+                    "run",
+                    "list",
+                    "--repo",
+                    slug,
+                    "--limit",
+                    "1",
+                    "--json",
+                    "conclusion,name",
+                    "--jq",
+                    ".[0].conclusion",
+                ])
+                .output();
+
+            let conclusion = output
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let is_allowed_failure = conclusion != "success"
+                && (glob_list_match(global_allowlist, &conclusion)
+                    || crate_names.iter().any(|name| {
+                        config
+                            .release
+                            .ci_allow_failures
+                            .get(*name)
+                            .is_some_and(|list| glob_list_match(list, &conclusion))
+                    }));
+
+            let status_str = if conclusion == "success" {
+                "pass"
+            } else if is_allowed_failure {
+                "allowed-failure"
+            } else if conclusion.is_empty() || conclusion == "null" {
+                "pending"
+            } else {
+                "BLOCKING"
+            };
+
+            println!(
+                "  {repo_dir} ({}): {conclusion} → {status_str}",
+                crate_names.join(", ")
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn run_publish(
+    root: &Path,
+    config: &SuperworkConfig,
+    tier: usize,
+    dry_run: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+
+    let level = levels
+        .get(tier)
+        .ok_or_else(|| format!("tier {tier} does not exist (max: {})", levels.len() - 1))?;
+
+    let wait_secs = config.release.index_wait_secs;
+    let label = if dry_run { "[dry-run] " } else { "" };
+
+    let mut published = 0;
+    let mut failed = 0;
+
+    for name in level {
+        let Some(ca) = analyses.get(name.as_str()) else {
+            continue;
+        };
+        if ca.bump == "skip" || ca.category == "skip" {
+            continue;
+        }
+
+        let info = &eco.crates[name];
+        let crate_dir = info.manifest_path.parent().unwrap();
+
+        println!("{label}Publishing {name} {}...", info.version);
+
+        if dry_run {
+            published += 1;
+            continue;
+        }
+
+        let status = Command::new("cargo")
+            .args(["publish"])
+            .current_dir(crate_dir)
+            .status()
+            .map_err(|e| format!("cargo publish {name}: {e}"))?;
+
+        if !status.success() {
+            eprintln!("  ERROR: cargo publish {name} failed");
+            failed += 1;
+            continue;
+        }
+
+        published += 1;
+
+        // Wait for index propagation
+        if wait_secs > 0 {
+            println!("  waiting {wait_secs}s for index propagation...");
+            std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+        }
+
+        // Verify on crates.io (3 attempts)
+        let mut verified = false;
+        for attempt in 1..=3 {
+            let output = Command::new("cargo").args(["info", name]).output();
+
+            if let Ok(o) = output {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                if stdout.contains(&info.version) {
+                    println!("  verified on crates.io (attempt {attempt})");
+                    verified = true;
+                    break;
+                }
+            }
+
+            if attempt < 3 {
+                println!("  not yet visible, retrying in 10s...");
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        }
+
+        if !verified {
+            eprintln!(
+                "  WARNING: could not verify {name} {} on crates.io",
+                info.version
+            );
+        }
+    }
+
+    println!("{label}Tier {tier}: {published} published, {failed} failed");
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn build_crate_analysis(
@@ -669,11 +1315,65 @@ fn load_all_analyses<'a>(
 }
 
 fn format_now() -> String {
-    // Simple RFC 3339 without chrono dependency
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = dur.as_secs();
-    // Good enough for timestamps — not worth adding chrono
     format!("{secs}")
+}
+
+/// Update a single field in a crate's analysis file
+fn update_analysis_field(
+    root: &Path,
+    info: &CrateInfo,
+    update: impl FnOnce(&mut CrateAnalysis),
+) -> Result<(), String> {
+    let repo_path = resolve_repo_path(root, &info.repo_dir);
+    let analysis_path = repo_path.join(".superwork").join(ANALYSIS_FILENAME);
+
+    if !analysis_path.exists() {
+        return Ok(()); // No analysis file to update
+    }
+
+    let content = std::fs::read_to_string(&analysis_path)
+        .map_err(|e| format!("reading {}: {e}", analysis_path.display()))?;
+    let mut analysis: RepoAnalysis = toml::from_str(&content)
+        .map_err(|e| format!("parsing {}: {e}", analysis_path.display()))?;
+
+    if let Some(ca) = analysis.crates.get_mut(&info.name) {
+        update(ca);
+    }
+
+    let new_content = toml::to_string_pretty(&analysis).map_err(|e| format!("serializing: {e}"))?;
+    std::fs::write(&analysis_path, new_content)
+        .map_err(|e| format!("writing {}: {e}", analysis_path.display()))?;
+
+    Ok(())
+}
+
+/// Run a command and return whether it succeeded
+fn run_cmd_ok(dir: &Path, program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if any pattern in the list matches the value (simple glob)
+fn glob_list_match(patterns: &[String], value: &str) -> bool {
+    patterns.iter().any(|p| {
+        if p == "*" {
+            true
+        } else if let Some(suffix) = p.strip_prefix('*') {
+            value.ends_with(suffix)
+        } else if let Some(prefix) = p.strip_suffix('*') {
+            value.starts_with(prefix)
+        } else {
+            p == value
+        }
+    })
 }
