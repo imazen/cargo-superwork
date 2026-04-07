@@ -76,6 +76,76 @@ pub struct Ecosystem {
     pub deps: Vec<InternalDep>,
 }
 
+/// Like scan_ecosystem, but also scans the current working directory if it
+/// wasn't already discovered. This handles CI environments where only the
+/// current repo is checked out, not the full ecosystem.
+pub fn scan_ecosystem_with_cwd(
+    ecosystem_root: &Path,
+    config: &SuperworkConfig,
+) -> Result<Ecosystem, String> {
+    let mut eco = scan_ecosystem(ecosystem_root, config)?;
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(eco);
+    };
+
+    // Check if any discovered crate lives under CWD
+    let cwd_covered = eco
+        .crates
+        .values()
+        .any(|c| c.manifest_path.starts_with(&cwd));
+
+    if cwd_covered || !cwd.join("Cargo.toml").exists() {
+        return Ok(eco);
+    }
+
+    // CWD has a Cargo.toml but wasn't discovered — scan it as a repo
+    scan_repo_dir(&cwd, ecosystem_root, config, &mut eco.crates)?;
+
+    // Re-scan deps for all crates (including newly added ones)
+    let crate_names: std::collections::BTreeSet<String> = eco.crates.keys().cloned().collect();
+
+    // Pre-parse workspace dep tables for the new crates
+    let mut ws_dep_tables: std::collections::BTreeMap<PathBuf, toml::value::Table> =
+        std::collections::BTreeMap::new();
+    for info in eco.crates.values() {
+        if let Some(ws_root) = &info.workspace_root {
+            if info.manifest_path.starts_with(&cwd) && !ws_dep_tables.contains_key(ws_root) {
+                if let Ok(content) = std::fs::read_to_string(ws_root) {
+                    if let Ok(doc) = content.parse::<toml::Value>() {
+                        if let Some(ws_deps) = doc
+                            .get("workspace")
+                            .and_then(|w| w.as_table())
+                            .and_then(|w| w.get("dependencies"))
+                            .and_then(|d| d.as_table())
+                        {
+                            ws_dep_tables.insert(ws_root.clone(), ws_deps.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for info in eco.crates.values() {
+        if info.manifest_path.starts_with(&cwd) {
+            let ws_deps = info
+                .workspace_root
+                .as_ref()
+                .and_then(|ws| ws_dep_tables.get(ws));
+            scan_deps_in_manifest(
+                &info.manifest_path,
+                &info.name,
+                &crate_names,
+                ws_deps,
+                &mut eco.deps,
+            )?;
+        }
+    }
+
+    Ok(eco)
+}
+
 /// Scan the ecosystem and build the crate registry
 pub fn scan_ecosystem(
     ecosystem_root: &Path,

@@ -11,7 +11,7 @@ pub fn run(
     filter_crate: Option<&str>,
     dry_run: bool,
 ) -> Result<(), String> {
-    let eco = discover::scan_ecosystem(ecosystem_root, config)?;
+    let eco = discover::scan_ecosystem_with_cwd(ecosystem_root, config)?;
 
     // Group deps by manifest file (the Cargo.toml being modified)
     let mut by_manifest: BTreeMap<&Path, Vec<&discover::InternalDep>> = BTreeMap::new();
@@ -123,6 +123,31 @@ pub fn run(
                     }
                 }
             }
+        }
+    }
+
+    // Also process any workspace roots not yet handled — they may have
+    // [workspace.dependencies] path entries that need transformation even if
+    // no member crate had cross-repo path deps in its own manifest.
+    for info in eco.crates.values() {
+        let ws_root = if let Some(ref ws) = info.workspace_root {
+            ws.clone()
+        } else if info.manifest_path.parent().unwrap().join("Cargo.toml") == info.manifest_path {
+            // Crate IS the workspace root — check if it has workspace.dependencies
+            info.manifest_path.clone()
+        } else {
+            continue;
+        };
+
+        if processed_ws_roots.contains(&ws_root) {
+            continue;
+        }
+        processed_ws_roots.insert(ws_root.clone());
+
+        let n = transform_workspace_deps(&ws_root, &eco, config, dry_run)?;
+        if n > 0 {
+            files_modified += 1;
+            changes += n;
         }
     }
 
@@ -280,6 +305,10 @@ fn transform_workspace_deps(
 ) -> Result<usize, String> {
     let ws_dir = ws_root.parent().unwrap();
 
+    if !ws_root.exists() {
+        return Ok(0);
+    }
+
     // Read the workspace Cargo.toml to find [workspace.dependencies] with path entries
     let content = std::fs::read_to_string(ws_root)
         .map_err(|e| format!("reading {}: {e}", ws_root.display()))?;
@@ -308,13 +337,12 @@ fn transform_workspace_deps(
             continue;
         };
 
-        // Check if path points outside the workspace directory
-        let resolved = ws_dir.join(path_str);
-        let resolved = resolved.canonicalize().unwrap_or(resolved);
-        let ws_canonical = ws_dir
-            .canonicalize()
-            .unwrap_or_else(|_| ws_dir.to_path_buf());
-        if resolved.starts_with(&ws_canonical) {
+        // Check if path points outside the workspace directory.
+        // Use lexical normalization (resolve .. without requiring path to exist)
+        // because in CI the target directory may not be checked out.
+        let resolved = normalize_path(&ws_dir.join(path_str));
+        let ws_normalized = normalize_path(ws_dir);
+        if resolved.starts_with(&ws_normalized) {
             continue; // Intra-workspace path, skip
         }
 
@@ -328,16 +356,18 @@ fn transform_workspace_deps(
         let git_url = if eco.crates.contains_key(actual_name) {
             dep_git_url(actual_name, eco, config)
         } else {
-            // Not in ecosystem — try convention
-            let basename = std::path::Path::new(path_str)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(dep_name);
-            Some(format!(
-                "https://github.com/{}/{}",
-                config.meta().default_github_org,
-                basename
-            ))
+            // Not in ecosystem — infer repo from the path structure.
+            // For "../imageflow/imageflow_core", the repo dir is "../imageflow",
+            // so check config.github_url_for with the relative repo dir.
+            let path_components: Vec<&str> = path_str.split('/').collect();
+            let repo_dir_guess = if path_components.len() >= 2 && path_components[0] == ".." {
+                // path = "../imageflow/imageflow_core" → repo_dir = "../imageflow"
+                format!("../{}", path_components[1])
+            } else {
+                // Flat path = just use the dep name
+                dep_name.to_string()
+            };
+            config.github_url_for(&repo_dir_guess)
         };
 
         let Some(git_url) = git_url else {
@@ -547,4 +577,21 @@ fn find_member_manifest(
 
     let _ = pattern;
     Ok(None)
+}
+
+/// Lexically normalize a path: resolve `.` and `..` without touching the filesystem.
+/// This is needed because `canonicalize()` fails for paths that don't exist (common in CI).
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut result = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    result
 }
