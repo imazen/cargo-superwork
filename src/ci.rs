@@ -37,6 +37,7 @@ pub fn run(
 
     let mut files_modified = 0;
     let mut changes = 0;
+    let mut processed_ws_roots = std::collections::BTreeSet::<std::path::PathBuf>::new();
 
     // Process each crate
     for crate_name in &crates_to_process {
@@ -58,11 +59,45 @@ pub fn run(
             changes += n;
         }
 
-        // If this crate is in a workspace, also apply workspace-level overrides
+        // If this crate is in a workspace, apply workspace-level overrides
+        // and transform workspace.dependencies path deps to git URLs
         let inline_ci_ref = crate_info.inline_ci.as_ref();
         if let Some(ws_root) = &crate_info.workspace_root {
-            if let Some(merged) = config.ci_override_for(crate_name, inline_ci_ref) {
-                let n = apply_workspace_transforms(ws_root, &merged, dry_run)?;
+            // Only process each workspace root once
+            if !processed_ws_roots.contains(ws_root) {
+                processed_ws_roots.insert(ws_root.clone());
+
+                let merged = config.ci_override_for(crate_name, inline_ci_ref);
+                let n_overrides = if let Some(ref m) = merged {
+                    apply_workspace_transforms(ws_root, m, dry_run)?
+                } else {
+                    0
+                };
+
+                let n_deps = transform_workspace_deps(ws_root, &eco, config, dry_run)?;
+
+                let n = n_overrides + n_deps;
+                if n > 0 {
+                    files_modified += 1;
+                    changes += n;
+                }
+            }
+        } else {
+            // Not a workspace member — check for workspace.dependencies in the crate's own manifest
+            // (crate is both a package and a workspace root)
+            let ws_path = crate_info.manifest_path.clone();
+            if !processed_ws_roots.contains(&ws_path) {
+                processed_ws_roots.insert(ws_path.clone());
+
+                if let Some(ref merged) = config.ci_override_for(crate_name, inline_ci_ref) {
+                    let n = apply_workspace_transforms(&ws_path, merged, dry_run)?;
+                    if n > 0 {
+                        files_modified += 1;
+                        changes += n;
+                    }
+                }
+
+                let n = transform_workspace_deps(&ws_path, &eco, config, dry_run)?;
                 if n > 0 {
                     files_modified += 1;
                     changes += n;
@@ -123,7 +158,19 @@ fn apply_ci_transforms(
         .get(crate_name)
         .and_then(|c| c.inline_ci.as_ref());
 
+    // Determine the source crate's repo dir for same-repo detection
+    let from_repo = eco.crates.get(crate_name).map(|c| c.repo_dir.as_str());
+
     for dep in &deps {
+        // Skip intra-repo deps — they resolve naturally within the checkout
+        let to_repo = eco
+            .crates
+            .get(dep.to_crate.as_str())
+            .map(|c| c.repo_dir.as_str());
+        if from_repo.is_some() && from_repo == to_repo {
+            continue;
+        }
+
         let strategy = config.ci_strategy_for(crate_name, &dep.to_crate, inline_ci);
         let section = dep_section_key(dep.section);
 
@@ -184,7 +231,7 @@ fn apply_ci_transforms(
     Ok(changes)
 }
 
-/// Apply workspace-level transforms (member removal, workspace dep removal)
+/// Apply workspace-level transforms (member removal, workspace dep removal, section deletion)
 fn apply_workspace_transforms(
     ws_root: &Path,
     ovr: &MergedCiOverride<'_>,
@@ -205,11 +252,152 @@ fn apply_workspace_transforms(
         }
     }
 
+    // Also delete sections from the workspace root (e.g., patch.crates-io)
+    for section in ovr.delete_sections() {
+        if manifest::delete_section(&mut doc, section) {
+            changes += 1;
+        }
+    }
+
     if changes > 0 {
         let wrote = manifest::write_manifest(ws_root, &doc, dry_run)?;
         if wrote {
             let label = if dry_run { "[dry-run] " } else { "" };
             println!("{label}{}: {changes} workspace changes", ws_root.display());
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Transform [workspace.dependencies] path entries to git URLs.
+/// Only transforms deps that reference crates in OTHER repos (not intra-workspace paths).
+fn transform_workspace_deps(
+    ws_root: &Path,
+    eco: &Ecosystem,
+    config: &SuperworkConfig,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let ws_dir = ws_root.parent().unwrap();
+
+    // Read the workspace Cargo.toml to find [workspace.dependencies] with path entries
+    let content = std::fs::read_to_string(ws_root)
+        .map_err(|e| format!("reading {}: {e}", ws_root.display()))?;
+    let parsed: toml::Value =
+        toml::from_str(&content).map_err(|e| format!("parsing {}: {e}", ws_root.display()))?;
+
+    let ws_deps = match parsed
+        .get("workspace")
+        .and_then(|w| w.as_table())
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        Some(t) => t,
+        None => return Ok(0),
+    };
+
+    // Find workspace deps that have path entries pointing outside this repo
+    let mut to_transform: Vec<(String, String)> = Vec::new(); // (dep_key, git_url)
+
+    for (dep_name, dep_value) in ws_deps {
+        let path = dep_value
+            .as_table()
+            .and_then(|t| t.get("path"))
+            .and_then(|p| p.as_str());
+        let Some(path_str) = path else {
+            continue;
+        };
+
+        // Check if path points outside the workspace directory
+        let resolved = ws_dir.join(path_str);
+        let resolved = resolved.canonicalize().unwrap_or(resolved);
+        let ws_canonical = ws_dir
+            .canonicalize()
+            .unwrap_or_else(|_| ws_dir.to_path_buf());
+        if resolved.starts_with(&ws_canonical) {
+            continue; // Intra-workspace path, skip
+        }
+
+        // This is an external dep — resolve the actual crate name and get git URL
+        let actual_name = dep_value
+            .as_table()
+            .and_then(|t| t.get("package"))
+            .and_then(|p| p.as_str())
+            .unwrap_or(dep_name);
+
+        let git_url = if eco.crates.contains_key(actual_name) {
+            dep_git_url(actual_name, eco, config)
+        } else {
+            // Not in ecosystem — try convention
+            let basename = std::path::Path::new(path_str)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(dep_name);
+            Some(format!(
+                "https://github.com/{}/{}",
+                config.meta().default_github_org,
+                basename
+            ))
+        };
+
+        let Some(git_url) = git_url else {
+            continue;
+        };
+
+        to_transform.push((dep_name.clone(), git_url));
+    }
+
+    if to_transform.is_empty() {
+        return Ok(0);
+    }
+
+    // Apply transforms using toml_edit
+    let (_, mut doc) = manifest::read_manifest(ws_root)?;
+    let mut changes = 0;
+
+    for (dep_name, git_url) in &to_transform {
+        // Navigate to workspace.dependencies.{dep_name} and replace path with git
+        if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_mut()) {
+            if let Some(ws_deps) = ws
+                .get_mut("dependencies")
+                .and_then(|d| d.as_table_like_mut())
+            {
+                if let Some(dep) = ws_deps.get_mut(dep_name) {
+                    let replaced = if let Some(tbl) = dep.as_inline_table_mut() {
+                        tbl.remove("path");
+                        tbl.insert("git", git_url.as_str().into());
+                        true
+                    } else if let Some(tbl) = dep.as_table_mut() {
+                        tbl.remove("path");
+                        tbl.insert("git", toml_edit::value(git_url.as_str()));
+                        true
+                    } else {
+                        false
+                    };
+                    if replaced {
+                        changes += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if changes > 0 {
+        // Also delete [patch.crates-io] if it has path entries
+        if manifest::delete_section(&mut doc, "patch.crates-io") {
+            changes += 1;
+        }
+
+        let wrote = manifest::write_manifest(ws_root, &doc, dry_run)?;
+        if wrote {
+            let label = if dry_run { "[dry-run] " } else { "" };
+            let dep_names: Vec<&str> = to_transform.iter().map(|(n, _)| n.as_str()).collect();
+            println!(
+                "{label}{}: {} workspace deps → git ({})",
+                ws_root.display(),
+                changes,
+                dep_names.join(", ")
+            );
         }
     }
 
