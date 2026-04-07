@@ -139,6 +139,36 @@ pub fn delete_dep(doc: &mut DocumentMut, section: &str, dep_name: &str) -> bool 
     false
 }
 
+/// Remove all `dep:{dep_name}` references from the `[features]` section.
+/// Called after deleting a dependency to avoid cargo errors.
+/// Returns the number of feature entries modified.
+pub fn strip_dep_from_features(doc: &mut DocumentMut, dep_name: &str) -> usize {
+    let Some(features) = doc.get_mut("features").and_then(|f| f.as_table_mut()) else {
+        return 0;
+    };
+
+    let dep_ref = format!("dep:{dep_name}");
+    let mut changes = 0;
+
+    for (_feat_name, feat_value) in features.iter_mut() {
+        if let Some(arr) = feat_value.as_array_mut() {
+            let orig_len = arr.len();
+            // Remove entries matching "dep:name" or containing "dep:name" as substring
+            // (handles both standalone "dep:foo" and feature-gated "foo/bar" where foo is the dep)
+            arr.retain(|v| {
+                v.as_str()
+                    .map(|s| s != dep_ref && !s.starts_with(&format!("{dep_name}/")))
+                    .unwrap_or(true)
+            });
+            if arr.len() != orig_len {
+                changes += 1;
+            }
+        }
+    }
+
+    changes
+}
+
 /// Delete a TOML section (e.g., "patch.crates-io").
 /// Handles dotted section paths like "patch.crates-io".
 /// Returns true if the section was found and removed.

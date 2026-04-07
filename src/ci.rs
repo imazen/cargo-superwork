@@ -232,6 +232,12 @@ fn apply_ci_transforms(
                 if manifest::delete_dep(&mut doc, section, &dep.to_crate) {
                     changes += 1;
                 }
+                // Also strip dep:name references from [features]
+                changes += manifest::strip_dep_from_features(&mut doc, &dep.to_crate);
+                // Strip using dep_key too (handles package renames)
+                if dep.dep_key != dep.to_crate {
+                    changes += manifest::strip_dep_from_features(&mut doc, &dep.dep_key);
+                }
             }
         }
     }
