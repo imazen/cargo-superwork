@@ -43,9 +43,12 @@ pub struct SuperworkspaceMeta {
     /// Default GitHub org for URL generation
     #[serde(default = "default_org")]
     pub default_github_org: String,
-    /// Additional directories to scan (relative to config file)
+    /// Additional directories to scan as individual repos (relative to config file)
     #[serde(default)]
     pub extra_roots: Vec<String>,
+    /// Directories whose subdirectories are scanned as repos (like the main root)
+    #[serde(default)]
+    pub scan_dirs: Vec<String>,
     /// GitHub orgs/users that own crates in this superworkspace.
     /// Crates on crates.io whose `repository` URL doesn't match any of these
     /// are considered external forks (use crates.io version, don't publish).
@@ -287,15 +290,25 @@ impl SuperworkConfig {
         }
     }
 
-    pub fn scan_roots(&self, superworkspace_root: &Path) -> Vec<PathBuf> {
-        let mut roots = vec![superworkspace_root.to_path_buf()];
+    /// Returns (main_root + scan_dirs, extra_roots).
+    /// First vec: directories whose subdirectories are scanned as repos.
+    /// Second vec: individual repo directories.
+    pub fn scan_roots(&self, superworkspace_root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut dirs = vec![superworkspace_root.to_path_buf()];
+        for sd in &self.meta().scan_dirs {
+            let resolved = superworkspace_root.join(sd);
+            if let Ok(canonical) = resolved.canonicalize() {
+                dirs.push(canonical);
+            }
+        }
+        let mut roots = Vec::new();
         for extra in &self.meta().extra_roots {
             let resolved = superworkspace_root.join(extra);
             if let Ok(canonical) = resolved.canonicalize() {
                 roots.push(canonical);
             }
         }
-        roots
+        (dirs, roots)
     }
 
     /// Get the command for a named check, with per-repo override support

@@ -83,12 +83,17 @@ pub fn scan_ecosystem(
 ) -> Result<Ecosystem, String> {
     let mut crates = BTreeMap::new();
 
-    // Scan main root and extra roots
-    let scan_roots = config.scan_roots(ecosystem_root);
+    // Scan directories (subdirectories are repos) and individual repo roots
+    let (scan_dirs, extra_roots) = config.scan_roots(ecosystem_root);
 
-    for scan_root in &scan_roots {
-        let is_main_root = scan_root == ecosystem_root;
-        scan_root_dir(scan_root, ecosystem_root, is_main_root, config, &mut crates)?;
+    // scan_dirs: scan each subdirectory as a repo (like the main root)
+    for scan_dir in &scan_dirs {
+        scan_root_dir(scan_dir, ecosystem_root, true, config, &mut crates)?;
+    }
+
+    // extra_roots: scan each as an individual repo
+    for extra_root in &extra_roots {
+        scan_root_dir(extra_root, ecosystem_root, false, config, &mut crates)?;
     }
 
     // Now scan for internal dependencies

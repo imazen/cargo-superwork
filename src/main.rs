@@ -169,6 +169,15 @@ enum Command {
         #[command(subcommand)]
         command: release::ReleaseCommand,
     },
+    /// Clone all ecosystem repos on a new machine
+    Setup {
+        /// Actually clone (default: dry-run showing what would be cloned)
+        #[arg(long)]
+        run: bool,
+        /// Use SSH URLs (git@github.com:) instead of HTTPS
+        #[arg(long)]
+        ssh: bool,
+    },
     /// Add version specs to path-only internal deps (makes them dual-specified for publish)
     FixDualSpec {
         /// Only fix deps from crates matching this glob
@@ -271,6 +280,7 @@ fn main() {
             run::run_outdated(&root, &config, filter.as_deref(), deep)
         }
         Command::Release { command } => release::run(&root, &config, &command, cli.dry_run),
+        Command::Setup { run, ssh } => run_setup(&root, &config, run, ssh),
         Command::FixDualSpec { filter, target } => fix_dual_spec::run(
             &root,
             &config,
@@ -283,6 +293,129 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {e}");
         process::exit(1);
+    }
+}
+
+fn run_setup(
+    root: &std::path::Path,
+    config: &config::SuperworkConfig,
+    execute: bool,
+    ssh: bool,
+) -> Result<(), String> {
+    // Build repo list from config (not from scan — repos may not exist yet)
+    let mut repos: Vec<(String, String)> = Vec::new();
+    let meta = config.meta();
+
+    // Collect repo dirs from [[repo]] overrides
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for r in &config.repo {
+        if r.no_remote {
+            continue;
+        }
+        let gh = r.github.as_deref().unwrap_or_else(|| {
+            std::path::Path::new(&r.dir)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&r.dir)
+        });
+        let url = format_clone_url(gh, &meta.default_github_org, ssh);
+        repos.push((r.dir.clone(), url));
+        seen.insert(r.dir.clone());
+    }
+
+    // Scan existing repos to find any not covered by [[repo]] overrides
+    // (best-effort: some dirs may not exist yet on a fresh machine)
+    if let Ok(eco) = discover::scan_ecosystem(root, config) {
+        for info in eco.crates.values() {
+            if !seen.contains(&info.repo_dir) {
+                if let Some(gh_url) = &info.github_url {
+                    let slug = gh_url.strip_prefix("https://github.com/").unwrap_or(gh_url);
+                    let url = if ssh {
+                        format!("git@github.com:{slug}.git")
+                    } else {
+                        format!("https://github.com/{slug}")
+                    };
+                    repos.push((info.repo_dir.clone(), url));
+                    seen.insert(info.repo_dir.clone());
+                }
+            }
+        }
+    }
+
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let label = if execute { "" } else { "[dry-run] " };
+    println!(
+        "{label}Setting up {} repos for '{}' superworkspace",
+        repos.len(),
+        meta.name.as_deref().unwrap_or("default")
+    );
+    println!();
+
+    let mut cloned = 0;
+    let mut existed = 0;
+    let mut failed = 0;
+
+    for (dir, url) in &repos {
+        let target = root.join(dir);
+
+        if target.join(".git").exists() || target.join(".git").is_file() {
+            println!("{label}  exists: {dir}");
+            existed += 1;
+            continue;
+        }
+
+        println!("{label}  clone:  {dir} ← {url}");
+
+        if !execute {
+            cloned += 1;
+            continue;
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+
+        let status = std::process::Command::new("git")
+            .args(["clone", url, &target.to_string_lossy()])
+            .status()
+            .map_err(|e| format!("git clone {url}: {e}"))?;
+
+        if status.success() {
+            cloned += 1;
+        } else {
+            eprintln!("  ERROR: git clone failed for {dir}");
+            failed += 1;
+        }
+    }
+
+    println!();
+    println!(
+        "{label}{cloned} cloned, {existed} already existed, {failed} failed (of {} total)",
+        repos.len()
+    );
+
+    if !execute && cloned > 0 {
+        println!();
+        println!("Run with --run to actually clone. Add --ssh for SSH URLs.");
+    }
+
+    Ok(())
+}
+
+fn format_clone_url(slug_or_name: &str, default_org: &str, ssh: bool) -> String {
+    let slug = if slug_or_name.contains('/') {
+        slug_or_name.to_string()
+    } else {
+        format!("{default_org}/{slug_or_name}")
+    };
+    if ssh {
+        format!("git@github.com:{slug}.git")
+    } else {
+        format!("https://github.com/{slug}")
     }
 }
 
