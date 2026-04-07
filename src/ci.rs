@@ -43,15 +43,25 @@ pub fn run(
         by_manifest.entry(&dep.manifest_path).or_default().push(dep);
     }
 
-    // Determine which crates to process
+    // Determine which crates to process.
+    // In CI, only process crates under the current working directory (the project
+    // being built), not every crate in the ecosystem. This prevents touching
+    // unrelated repos like retired projects.
+    let cwd = std::env::current_dir().ok();
     let crates_to_process: Vec<&str> = if let Some(name) = filter_crate {
         vec![name]
     } else {
-        // Process all crates that have CI overrides, plus all crates with internal path deps
         let mut names: Vec<&str> = eco
             .deps
             .iter()
             .filter(|d| d.has_path)
+            .filter(|d| {
+                // Only include crates under CWD (if known)
+                match (&cwd, eco.crates.get(d.from_crate.as_str())) {
+                    (Some(cwd), Some(info)) => info.manifest_path.starts_with(cwd),
+                    _ => true, // No CWD or crate not found — include
+                }
+            })
             .map(|d| d.from_crate.as_str())
             .collect();
         names.sort();
@@ -177,11 +187,18 @@ pub fn run(
     // Also process any workspace roots not yet handled — they may have
     // [workspace.dependencies] path entries that need transformation even if
     // no member crate had cross-repo path deps in its own manifest.
+    // Only process workspace roots under CWD.
     for info in eco.crates.values() {
+        // Skip crates not under CWD
+        if let Some(ref cwd) = cwd {
+            if !info.manifest_path.starts_with(cwd) {
+                continue;
+            }
+        }
+
         let ws_root = if let Some(ref ws) = info.workspace_root {
             ws.clone()
         } else if info.manifest_path.parent().unwrap().join("Cargo.toml") == info.manifest_path {
-            // Crate IS the workspace root — check if it has workspace.dependencies
             info.manifest_path.clone()
         } else {
             continue;
