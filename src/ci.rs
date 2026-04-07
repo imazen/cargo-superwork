@@ -4,7 +4,14 @@ use crate::manifest;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Run ci-prep: transform Cargo.toml files for CI
+/// Run ci-prep: transform Cargo.toml files for CI.
+///
+/// Strategy overview:
+/// - `git_url`: Replace path with git URL (broken for transitive path deps)
+/// - `strip_path`: Remove path, keep version. Auto-generates [patch.crates-io]
+///   entries with git URLs so cargo fetches from git instead of the index.
+///   This is the recommended strategy — it handles transitive deps correctly.
+/// - `delete`: Remove the dependency entirely (also strips feature references).
 pub fn run(
     ecosystem_root: &Path,
     config: &SuperworkConfig,
@@ -38,6 +45,10 @@ pub fn run(
     let mut files_modified = 0;
     let mut changes = 0;
     let mut processed_ws_roots = std::collections::BTreeSet::<std::path::PathBuf>::new();
+    // Track stripped deps per project root for [patch.crates-io] generation.
+    // Key = manifest path to add [patch.crates-io] to (workspace root or standalone crate).
+    // Value = list of (crate_name, git_url) entries.
+    let mut patch_entries: BTreeMap<std::path::PathBuf, Vec<(String, String)>> = BTreeMap::new();
 
     // Process each crate
     for crate_name in &crates_to_process {
@@ -53,10 +64,30 @@ pub fn run(
 
         // Apply CI overrides to the crate's own manifest
         let manifest_path = &crate_info.manifest_path;
-        let n = apply_ci_transforms(manifest_path, crate_name, &eco, config, dry_run)?;
+        let mut crate_stripped = Vec::new();
+        let n = apply_ci_transforms(
+            manifest_path,
+            crate_name,
+            &eco,
+            config,
+            dry_run,
+            &mut crate_stripped,
+        )?;
         if n > 0 {
             files_modified += 1;
             changes += n;
+        }
+
+        // Record stripped deps for [patch.crates-io] generation at the project root
+        if !crate_stripped.is_empty() {
+            let project_root = crate_info
+                .workspace_root
+                .as_deref()
+                .unwrap_or(manifest_path);
+            patch_entries
+                .entry(project_root.to_path_buf())
+                .or_default()
+                .extend(crate_stripped);
         }
 
         // If this crate is in a workspace, apply workspace-level overrides
@@ -151,6 +182,61 @@ pub fn run(
         }
     }
 
+    // Generate [patch.crates-io] sections for projects that had deps stripped.
+    // This makes cargo fetch from git instead of the (possibly stale) crates.io index.
+    for (project_root, entries) in &patch_entries {
+        if entries.is_empty() {
+            continue;
+        }
+
+        let (_, mut doc) = manifest::read_manifest(project_root)?;
+
+        // Deduplicate entries (same crate from multiple sections)
+        let mut seen = std::collections::BTreeSet::new();
+        let mut unique: Vec<(&str, &str)> = Vec::new();
+        for (name, url) in entries {
+            if seen.insert(name.as_str()) {
+                unique.push((name, url));
+            }
+        }
+
+        // Create or get [patch.crates-io] table
+        let patch = doc
+            .entry("patch")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .unwrap();
+        let crates_io = patch
+            .entry("crates-io")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .unwrap();
+
+        let mut added = 0;
+        for (name, url) in &unique {
+            if crates_io.contains_key(name) {
+                continue; // Don't overwrite existing entries
+            }
+            let mut tbl = toml_edit::InlineTable::new();
+            tbl.insert("git", (*url).into());
+            crates_io.insert(name, toml_edit::value(tbl));
+            added += 1;
+        }
+
+        if added > 0 {
+            let wrote = manifest::write_manifest(project_root, &doc, dry_run)?;
+            if wrote {
+                let label = if dry_run { "[dry-run] " } else { "" };
+                println!(
+                    "{label}{}: added {added} [patch.crates-io] entries",
+                    project_root.display()
+                );
+                files_modified += 1;
+                changes += added;
+            }
+        }
+    }
+
     if dry_run {
         println!("[dry-run] would modify {files_modified} files ({changes} changes)");
     } else {
@@ -167,6 +253,7 @@ fn apply_ci_transforms(
     eco: &Ecosystem,
     config: &SuperworkConfig,
     dry_run: bool,
+    stripped_deps: &mut Vec<(String, String)>, // (crate_name, git_url) for [patch.crates-io]
 ) -> Result<usize, String> {
     let (_, mut doc) = manifest::read_manifest(manifest_path)?;
     let mut changes = 0;
@@ -218,15 +305,21 @@ fn apply_ci_transforms(
                 }
             }
             CiStrategy::StripPath => {
-                // Remove path, keep version (requires dual-spec)
+                // Remove path, keep version. Record for [patch.crates-io] generation.
                 if !dep.has_version {
                     eprintln!(
                         "  warning: strip_path on {}->{} but no version specified",
                         crate_name, dep.to_crate
                     );
                 }
-                if manifest::remove_dep_path(&mut doc, section, &dep.to_crate) {
+                if manifest::remove_dep_path(&mut doc, section, &dep.dep_key) {
                     changes += 1;
+                    // Record for [patch.crates-io] — use actual crate name, not dep key
+                    if let Some(url) =
+                        dep_git_url(&dep.to_crate, dep.path_value.as_deref(), eco, config)
+                    {
+                        stripped_deps.push((dep.to_crate.clone(), url));
+                    }
                 }
             }
             CiStrategy::Delete => {
@@ -377,26 +470,22 @@ fn transform_workspace_deps(
     let (_, mut doc) = manifest::read_manifest(ws_root)?;
     let mut changes = 0;
 
-    for (dep_name, git_url) in &to_transform {
-        // Navigate to workspace.dependencies.{dep_name} and replace path with git
+    // Strip paths from workspace deps and build [patch.crates-io] entries
+    for (dep_name, _git_url) in &to_transform {
         if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_mut()) {
             if let Some(ws_deps) = ws
                 .get_mut("dependencies")
                 .and_then(|d| d.as_table_like_mut())
             {
                 if let Some(dep) = ws_deps.get_mut(dep_name) {
-                    let replaced = if let Some(tbl) = dep.as_inline_table_mut() {
-                        tbl.remove("path");
-                        tbl.insert("git", git_url.as_str().into());
-                        true
+                    let stripped = if let Some(tbl) = dep.as_inline_table_mut() {
+                        tbl.remove("path").is_some()
                     } else if let Some(tbl) = dep.as_table_mut() {
-                        tbl.remove("path");
-                        tbl.insert("git", toml_edit::value(git_url.as_str()));
-                        true
+                        tbl.remove("path").is_some()
                     } else {
                         false
                     };
-                    if replaced {
+                    if stripped {
                         changes += 1;
                     }
                 }
@@ -405,9 +494,31 @@ fn transform_workspace_deps(
     }
 
     if changes > 0 {
-        // Also delete [patch.crates-io] if it has path entries
-        if manifest::delete_section(&mut doc, "patch.crates-io") {
-            changes += 1;
+        // Delete existing [patch.crates-io] (may have stale local path entries)
+        manifest::delete_section(&mut doc, "patch.crates-io");
+
+        // Add [patch.crates-io] with git URLs for stripped deps
+        let patch = doc
+            .entry("patch")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .unwrap();
+        let crates_io = patch
+            .entry("crates-io")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .unwrap();
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (dep_name, git_url) in &to_transform {
+            // Use the actual crate name (resolve package rename)
+            let actual = dep_name; // already the TOML key; we need the crate name
+            if !seen.insert(actual.clone()) {
+                continue;
+            }
+            let mut tbl = toml_edit::InlineTable::new();
+            tbl.insert("git", git_url.as_str().into());
+            crates_io.insert(actual, toml_edit::value(tbl));
         }
 
         let wrote = manifest::write_manifest(ws_root, &doc, dry_run)?;
