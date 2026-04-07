@@ -204,23 +204,47 @@ pub fn run(
     // their own path deps to other ecosystem crates, so every publishable
     // crate needs a patch entry to ensure resolution.
     if !patch_entries.is_empty() {
-        // Build complete patch map: every publishable crate → git URL.
-        // Use pre-computed patch_repos from config (works in CI without full checkout),
-        // supplemented by live ecosystem scan (for completeness when running locally).
-        let mut all_patches: BTreeMap<String, String> = BTreeMap::new();
+        // Build patch map from the directly stripped deps AND their transitive
+        // ecosystem siblings (other crates in the same git repos).
+        // Using pre-computed patch_repos from config for URL lookups.
 
-        // Start with pre-computed list from Superwork.toml [ci.patch_repos]
-        for (name, url) in &config.ci.patch_repos {
-            all_patches.insert(name.clone(), url.clone());
+        // Collect all repos referenced by stripped deps
+        let mut needed_repos: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for entries in patch_entries.values() {
+            for (_, url) in entries {
+                needed_repos.insert(url.clone());
+            }
         }
 
-        // Supplement with live ecosystem data (may add crates not in the static list)
+        // Build patch map: all crates from needed repos
+        let mut all_patches: BTreeMap<String, String> = BTreeMap::new();
+
+        // From pre-computed list: include crates whose repo is in needed_repos
+        for (name, url) in &config.ci.patch_repos {
+            if needed_repos.contains(url) {
+                all_patches.insert(name.clone(), url.clone());
+            }
+        }
+
+        // From live ecosystem: same filter
         for info in eco.crates.values() {
             if !info.publishable || all_patches.contains_key(&info.name) {
                 continue;
             }
             if let Some(url) = dep_git_url(&info.name, None, &eco, config) {
-                all_patches.insert(info.name.clone(), url);
+                if needed_repos.contains(&url) {
+                    all_patches.insert(info.name.clone(), url);
+                }
+            }
+        }
+
+        // Also add directly stripped deps (they may not be in the pre-computed list)
+        for entries in patch_entries.values() {
+            for (name, url) in entries {
+                all_patches
+                    .entry(name.clone())
+                    .or_insert_with(|| url.clone());
             }
         }
 
