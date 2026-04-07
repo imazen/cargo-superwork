@@ -170,6 +170,8 @@ enum Command {
         #[command(subcommand)]
         command: release::ReleaseCommand,
     },
+    /// Print [patch.crates-io] entries for all ecosystem crates (for CI config)
+    CiPatchList,
     /// Generate/sync CI workflow files across all repos from a template
     CiGen {
         /// Path to template file (default: ci-template.yml in workspace root)
@@ -289,6 +291,7 @@ fn main() {
         Command::Outdated { filter, deep } => {
             run::run_outdated(&root, &config, filter.as_deref(), deep)
         }
+        Command::CiPatchList => ci::run_patch_list(&root, &config),
         Command::CiGen { template, filter } => ci_gen::run(
             &root,
             &config,

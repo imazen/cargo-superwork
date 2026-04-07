@@ -4,6 +4,23 @@ use crate::manifest;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Print [patch.crates-io] entries for all publishable ecosystem crates.
+/// Output is TOML that can be added to Superwork.toml as [ci.patch_repos].
+pub fn run_patch_list(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(ecosystem_root, config)?;
+
+    println!("[ci.patch_repos]");
+    for info in eco.crates.values() {
+        if !info.publishable {
+            continue;
+        }
+        if let Some(url) = config.github_url_for(&info.repo_dir) {
+            println!("{} = \"{}\"", info.name, url);
+        }
+    }
+    Ok(())
+}
+
 /// Run ci-prep: transform Cargo.toml files for CI.
 ///
 /// Strategy overview:
@@ -182,57 +199,71 @@ pub fn run(
         }
     }
 
-    // Generate [patch.crates-io] sections for projects that had deps stripped.
-    // This makes cargo fetch from git instead of the (possibly stale) crates.io index.
-    for (project_root, entries) in &patch_entries {
-        if entries.is_empty() {
-            continue;
+    // Generate [patch.crates-io] entries for ALL ecosystem crates, not just
+    // the directly stripped deps. Transitive deps fetched via git may have
+    // their own path deps to other ecosystem crates, so every publishable
+    // crate needs a patch entry to ensure resolution.
+    if !patch_entries.is_empty() {
+        // Build complete patch map: every publishable crate → git URL.
+        // Use pre-computed patch_repos from config (works in CI without full checkout),
+        // supplemented by live ecosystem scan (for completeness when running locally).
+        let mut all_patches: BTreeMap<String, String> = BTreeMap::new();
+
+        // Start with pre-computed list from Superwork.toml [ci.patch_repos]
+        for (name, url) in &config.ci.patch_repos {
+            all_patches.insert(name.clone(), url.clone());
         }
 
-        let (_, mut doc) = manifest::read_manifest(project_root)?;
-
-        // Deduplicate entries (same crate from multiple sections)
-        let mut seen = std::collections::BTreeSet::new();
-        let mut unique: Vec<(&str, &str)> = Vec::new();
-        for (name, url) in entries {
-            if seen.insert(name.as_str()) {
-                unique.push((name, url));
+        // Supplement with live ecosystem data (may add crates not in the static list)
+        for info in eco.crates.values() {
+            if !info.publishable || all_patches.contains_key(&info.name) {
+                continue;
+            }
+            if let Some(url) = dep_git_url(&info.name, None, &eco, config) {
+                all_patches.insert(info.name.clone(), url);
             }
         }
 
-        // Create or get [patch.crates-io] table
-        let patch = doc
-            .entry("patch")
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut()
-            .unwrap();
-        let crates_io = patch
-            .entry("crates-io")
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut()
-            .unwrap();
+        for project_root in patch_entries.keys() {
+            let (_, mut doc) = manifest::read_manifest(project_root)?;
 
-        let mut added = 0;
-        for (name, url) in &unique {
-            if crates_io.contains_key(name) {
-                continue; // Don't overwrite existing entries
+            // Delete existing [patch.crates-io] (may have stale path entries)
+            manifest::delete_section(&mut doc, "patch.crates-io");
+
+            // Create [patch.crates-io] with git URLs for all ecosystem crates
+            let patch = doc
+                .entry("patch")
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+                .as_table_mut()
+                .unwrap();
+            let crates_io = patch
+                .entry("crates-io")
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+                .as_table_mut()
+                .unwrap();
+
+            let mut added = 0;
+            for (name, url) in &all_patches {
+                if crates_io.contains_key(name) {
+                    continue;
+                }
+                let mut tbl = toml_edit::InlineTable::new();
+                tbl.insert("git", url.as_str().into());
+                crates_io.insert(name, toml_edit::value(tbl));
+                added += 1;
             }
-            let mut tbl = toml_edit::InlineTable::new();
-            tbl.insert("git", (*url).into());
-            crates_io.insert(name, toml_edit::value(tbl));
-            added += 1;
-        }
 
-        if added > 0 {
-            let wrote = manifest::write_manifest(project_root, &doc, dry_run)?;
-            if wrote {
-                let label = if dry_run { "[dry-run] " } else { "" };
-                println!(
-                    "{label}{}: added {added} [patch.crates-io] entries",
-                    project_root.display()
-                );
-                files_modified += 1;
-                changes += added;
+            if added > 0 {
+                let wrote = manifest::write_manifest(project_root, &doc, dry_run)?;
+                if wrote {
+                    let label = if dry_run { "[dry-run] " } else { "" };
+                    println!(
+                        "{label}{}: added {added} [patch.crates-io] entries (full ecosystem)",
+                        project_root.display()
+                    );
+                    files_modified += 1;
+                    changes += added;
+                }
             }
         }
     }
