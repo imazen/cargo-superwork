@@ -202,16 +202,17 @@ fn apply_ci_transforms(
         match strategy {
             CiStrategy::GitUrl => {
                 // Replace path with git URL
-                let git_url = match dep_git_url(&dep.to_crate, eco, config) {
-                    Some(url) => url,
-                    None => {
-                        eprintln!(
-                            "  warning: no git URL for {} (dep of {}), skipping",
-                            dep.to_crate, crate_name
-                        );
-                        continue;
-                    }
-                };
+                let git_url =
+                    match dep_git_url(&dep.to_crate, dep.path_value.as_deref(), eco, config) {
+                        Some(url) => url,
+                        None => {
+                            eprintln!(
+                                "  warning: no git URL for {} (dep of {}), skipping",
+                                dep.to_crate, crate_name
+                            );
+                            continue;
+                        }
+                    };
                 if manifest::replace_path_with_git(&mut doc, section, &dep.to_crate, &git_url) {
                     changes += 1;
                 }
@@ -359,22 +360,7 @@ fn transform_workspace_deps(
             .and_then(|p| p.as_str())
             .unwrap_or(dep_name);
 
-        let git_url = if eco.crates.contains_key(actual_name) {
-            dep_git_url(actual_name, eco, config)
-        } else {
-            // Not in ecosystem — infer repo from the path structure.
-            // For "../imageflow/imageflow_core", the repo dir is "../imageflow",
-            // so check config.github_url_for with the relative repo dir.
-            let path_components: Vec<&str> = path_str.split('/').collect();
-            let repo_dir_guess = if path_components.len() >= 2 && path_components[0] == ".." {
-                // path = "../imageflow/imageflow_core" → repo_dir = "../imageflow"
-                format!("../{}", path_components[1])
-            } else {
-                // Flat path = just use the dep name
-                dep_name.to_string()
-            };
-            config.github_url_for(&repo_dir_guess)
-        };
+        let git_url = dep_git_url(actual_name, Some(path_str), eco, config);
 
         let Some(git_url) = git_url else {
             continue;
@@ -514,23 +500,36 @@ fn dep_section_key(section: DepSection) -> &'static str {
     }
 }
 
-/// Get the git URL for a dependency crate
+/// Get the git URL for a dependency crate.
+/// When the crate is in the ecosystem, uses its repo_dir for URL resolution.
+/// When not (CI without full checkout), infers repo from the dep's path value.
 pub(crate) fn dep_git_url(
     dep_name: &str,
+    dep_path: Option<&str>,
     eco: &Ecosystem,
     config: &SuperworkConfig,
 ) -> Option<String> {
     // Look up the crate's repo and get its GitHub URL
     if let Some(info) = eco.crates.get(dep_name) {
-        config.github_url_for(&info.repo_dir)
-    } else {
-        // Fallback: assume default org
-        Some(format!(
-            "https://github.com/{}/{}",
-            config.meta().default_github_org,
-            dep_name
-        ))
+        return config.github_url_for(&info.repo_dir);
     }
+
+    // Fallback: infer repo dir from the path value.
+    // "../zensally/crates/zensally-zentract" → repo dir is "../zensally"
+    if let Some(path_str) = dep_path {
+        let components: Vec<&str> = path_str.split('/').collect();
+        if components.len() >= 2 && components[0] == ".." {
+            let repo_dir = format!("../{}", components[1]);
+            return config.github_url_for(&repo_dir);
+        }
+    }
+
+    // Last resort: dep name = repo name
+    Some(format!(
+        "https://github.com/{}/{}",
+        config.meta().default_github_org,
+        dep_name
+    ))
 }
 
 /// Find a workspace member's Cargo.toml given the parent crate info and member name

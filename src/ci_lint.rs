@@ -236,7 +236,7 @@ fn classify_dep(
         }
 
         CiStrategy::GitUrl => {
-            let git_url = ci::dep_git_url(&dep.to_crate, eco, config);
+            let git_url = ci::dep_git_url(&dep.to_crate, dep.path_value.as_deref(), eco, config);
             if git_url.is_none() {
                 (
                     Severity::Error,
