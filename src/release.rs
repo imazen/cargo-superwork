@@ -16,6 +16,12 @@ use std::process::Command;
 
 #[derive(Subcommand)]
 pub enum ReleaseCommand {
+    /// Drive a full release wave: bump → commit → push → tag → CI → publish, tier by tier
+    Wave {
+        /// Advance the wave by one step (default: show current state)
+        #[arg(long)]
+        advance: bool,
+    },
     /// Scan ecosystem and generate per-repo release analysis files
     Init {
         /// Regenerate even if analysis files already exist
@@ -101,6 +107,7 @@ pub fn run(
     dry_run: bool,
 ) -> Result<(), String> {
     match command {
+        ReleaseCommand::Wave { advance } => run_wave(root, config, *advance, dry_run),
         ReleaseCommand::Init { force } => run_init(root, config, *force, dry_run),
         ReleaseCommand::Analyze {
             tier,
@@ -188,6 +195,409 @@ pub struct CrateAnalysis {
     pub semver_check: String,
     #[serde(default)]
     pub copter: String,
+}
+
+// ── Wave state (persisted in workspace repo) ──
+
+const WAVE_FILENAME: &str = "release-wave.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierStatus {
+    Pending,
+    Bumped,
+    Pushed,
+    Tagged,
+    CiWatching,
+    CiPassed,
+    Publishing,
+    Published,
+}
+
+impl std::fmt::Display for TierStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Bumped => write!(f, "bumped"),
+            Self::Pushed => write!(f, "pushed"),
+            Self::Tagged => write!(f, "tagged"),
+            Self::CiWatching => write!(f, "ci_watching"),
+            Self::CiPassed => write!(f, "ci_passed"),
+            Self::Publishing => write!(f, "publishing"),
+            Self::Published => write!(f, "published"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WaveState {
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub tiers: BTreeMap<String, TierState>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct TierState {
+    pub status: String,
+    #[serde(default)]
+    pub crates: Vec<String>,
+    /// GitHub Actions run IDs per repo (repo_dir → run_id)
+    #[serde(default)]
+    pub ci_runs: BTreeMap<String, String>,
+    /// CI conclusions per repo
+    #[serde(default)]
+    pub ci_results: BTreeMap<String, String>,
+}
+
+pub fn load_wave(root: &Path) -> WaveState {
+    let path = root.join(".superwork").join(WAVE_FILENAME);
+    if !path.exists() {
+        return WaveState::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| toml::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+fn save_wave(root: &Path, wave: &WaveState) -> Result<(), String> {
+    let dir = root.join(".superwork");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let content = toml::to_string_pretty(wave).map_err(|e| format!("serializing wave: {e}"))?;
+    let path = dir.join(WAVE_FILENAME);
+    std::fs::write(&path, content).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn tier_status(wave: &WaveState, tier: usize) -> TierStatus {
+    wave.tiers
+        .get(&tier.to_string())
+        .and_then(|t| match t.status.as_str() {
+            "pending" => Some(TierStatus::Pending),
+            "bumped" => Some(TierStatus::Bumped),
+            "pushed" => Some(TierStatus::Pushed),
+            "tagged" => Some(TierStatus::Tagged),
+            "ci_watching" => Some(TierStatus::CiWatching),
+            "ci_passed" => Some(TierStatus::CiPassed),
+            "publishing" => Some(TierStatus::Publishing),
+            "published" => Some(TierStatus::Published),
+            _ => None,
+        })
+        .unwrap_or(TierStatus::Pending)
+}
+
+fn set_tier_status(wave: &mut WaveState, tier: usize, status: TierStatus, crates: &[String]) {
+    let ts = wave.tiers.entry(tier.to_string()).or_default();
+    ts.status = status.to_string();
+    if ts.crates.is_empty() && !crates.is_empty() {
+        ts.crates = crates.to_vec();
+    }
+}
+
+// ── Wave orchestrator ──
+
+fn run_wave(
+    root: &Path,
+    config: &SuperworkConfig,
+    advance: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    let eco = discover::scan_ecosystem(root, config)?;
+    let levels = graph::publish_order(&eco, true)?;
+    let analyses = load_all_analyses(root, &eco)?;
+    let mut wave = load_wave(root);
+
+    if wave.started_at.is_empty() {
+        wave.started_at = format_now();
+        wave.workspace = config
+            .meta()
+            .name
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
+    }
+
+    // Initialize tier crate lists
+    for (idx, level) in levels.iter().enumerate() {
+        let active: Vec<String> = level
+            .iter()
+            .filter(|name| {
+                analyses
+                    .get(name.as_str())
+                    .is_some_and(|a| a.bump != "skip" && a.category != "skip" && !a.bump.is_empty())
+            })
+            .cloned()
+            .collect();
+        if !active.is_empty() && !wave.tiers.contains_key(&idx.to_string()) {
+            set_tier_status(&mut wave, idx, TierStatus::Pending, &active);
+        }
+    }
+
+    // Show current state
+    println!("=== Release Wave ===");
+    println!();
+    for (idx, _level) in levels.iter().enumerate() {
+        let status = tier_status(&wave, idx);
+        let ts = wave.tiers.get(&idx.to_string());
+        let count = ts.map(|t| t.crates.len()).unwrap_or(0);
+        if count == 0 {
+            continue;
+        }
+        let ci_info = ts
+            .filter(|t| !t.ci_results.is_empty())
+            .map(|t| {
+                let passed = t.ci_results.values().filter(|v| *v == "success").count();
+                format!(" (CI: {passed}/{} passed)", t.ci_results.len())
+            })
+            .unwrap_or_default();
+        println!("  Tier {idx}: {status} — {count} crates{ci_info}");
+    }
+    println!();
+
+    if !advance {
+        println!("Run with --advance to execute the next step.");
+        save_wave(root, &wave)?;
+        return Ok(());
+    }
+
+    // Find the first non-published tier and advance it
+    for (idx, _level) in levels.iter().enumerate() {
+        let status = tier_status(&wave, idx);
+        let ts = wave.tiers.get(&idx.to_string());
+        let crates = ts.map(|t| t.crates.clone()).unwrap_or_default();
+        if crates.is_empty() {
+            continue;
+        }
+
+        match status {
+            TierStatus::Published => continue,
+            TierStatus::Pending => {
+                println!("Tier {idx}: bumping versions...");
+                if !dry_run {
+                    run_bump(root, config, Some(idx), false)?;
+                    // Commit + push in each repo
+                    let tier_repos = tier_repo_paths(root, &eco, &crates);
+                    for (repo_dir, repo_path) in &tier_repos {
+                        let crate_list: Vec<&str> = crates
+                            .iter()
+                            .filter(|c| {
+                                eco.crates
+                                    .get(c.as_str())
+                                    .is_some_and(|i| i.repo_dir == *repo_dir)
+                            })
+                            .map(|s| s.as_str())
+                            .collect();
+                        let msg = format!("release: bump {}", crate_list.join(", "));
+                        let _ = Command::new("git")
+                            .args(["add", "-A"])
+                            .current_dir(repo_path)
+                            .status();
+                        let _ = Command::new("git")
+                            .args(["commit", "-m", &msg])
+                            .current_dir(repo_path)
+                            .status();
+                    }
+                }
+                set_tier_status(&mut wave, idx, TierStatus::Bumped, &crates);
+                save_wave(root, &wave)?;
+                println!("Tier {idx}: bumped. Run --advance again to push.");
+                return Ok(());
+            }
+            TierStatus::Bumped => {
+                println!("Tier {idx}: pushing to remotes...");
+                if !dry_run {
+                    let tier_repos = tier_repo_paths(root, &eco, &crates);
+                    for (repo_dir, repo_path) in &tier_repos {
+                        print!("  push {repo_dir}... ");
+                        let ok = Command::new("git")
+                            .args(["push"])
+                            .current_dir(repo_path)
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        println!("{}", if ok { "ok" } else { "FAIL" });
+                    }
+                }
+                set_tier_status(&mut wave, idx, TierStatus::Pushed, &crates);
+                save_wave(root, &wave)?;
+                println!("Tier {idx}: pushed. Run --advance again to tag.");
+                return Ok(());
+            }
+            TierStatus::Pushed => {
+                println!("Tier {idx}: creating tags + GH releases...");
+                if !dry_run {
+                    run_tag(root, config, idx, false)?;
+                    // Capture CI run IDs
+                    let tier_repos = tier_repo_paths(root, &eco, &crates);
+                    let ts = wave.tiers.entry(idx.to_string()).or_default();
+                    for (repo_dir, _) in &tier_repos {
+                        let slug = config
+                            .github_url_for(repo_dir)
+                            .and_then(|u| u.strip_prefix("https://github.com/").map(String::from));
+                        if let Some(slug) = slug {
+                            if let Some(run_id) = get_latest_run_id(&slug) {
+                                ts.ci_runs.insert(repo_dir.clone(), run_id);
+                            }
+                        }
+                    }
+                }
+                set_tier_status(&mut wave, idx, TierStatus::Tagged, &crates);
+                save_wave(root, &wave)?;
+                println!("Tier {idx}: tagged. Run --advance to check CI.");
+                return Ok(());
+            }
+            TierStatus::Tagged | TierStatus::CiWatching => {
+                println!("Tier {idx}: checking CI status...");
+                let tier_repos = tier_repo_paths(root, &eco, &crates);
+                let ts = wave.tiers.entry(idx.to_string()).or_default();
+                let global_allowlist = &config.release.ci_allow_failures_global;
+
+                let mut all_done = true;
+                let mut all_passed = true;
+                for (repo_dir, _) in &tier_repos {
+                    let slug = config
+                        .github_url_for(repo_dir)
+                        .and_then(|u| u.strip_prefix("https://github.com/").map(String::from));
+                    let conclusion = slug
+                        .as_ref()
+                        .and_then(|s| get_run_conclusion(s))
+                        .unwrap_or_default();
+
+                    ts.ci_results.insert(repo_dir.clone(), conclusion.clone());
+
+                    if conclusion.is_empty()
+                        || conclusion == "null"
+                        || conclusion == "in_progress"
+                        || conclusion == "queued"
+                    {
+                        all_done = false;
+                        print!("  {repo_dir}: pending");
+                    } else if conclusion == "success" {
+                        print!("  {repo_dir}: pass");
+                    } else if glob_list_match(global_allowlist, &conclusion) {
+                        print!("  {repo_dir}: {conclusion} (allowed)");
+                    } else {
+                        print!("  {repo_dir}: {conclusion}");
+                        all_passed = false;
+                    }
+                    println!();
+                }
+
+                if all_done && all_passed {
+                    set_tier_status(&mut wave, idx, TierStatus::CiPassed, &crates);
+                    save_wave(root, &wave)?;
+                    println!("Tier {idx}: CI passed! Run --advance to publish.");
+                } else if all_done {
+                    save_wave(root, &wave)?;
+                    println!("Tier {idx}: CI has failures. Fix or add to ci_allow_failures.");
+                } else {
+                    set_tier_status(&mut wave, idx, TierStatus::CiWatching, &crates);
+                    save_wave(root, &wave)?;
+                    println!("Tier {idx}: CI still running. Run --advance again later.");
+                }
+                return Ok(());
+            }
+            TierStatus::CiPassed => {
+                println!("Tier {idx}: publishing...");
+                set_tier_status(&mut wave, idx, TierStatus::Publishing, &crates);
+                save_wave(root, &wave)?;
+                if !dry_run {
+                    run_publish(root, config, idx, false)?;
+                }
+                set_tier_status(&mut wave, idx, TierStatus::Published, &crates);
+                save_wave(root, &wave)?;
+                println!("Tier {idx}: published!");
+                return Ok(());
+            }
+            TierStatus::Publishing => {
+                // Retry publish
+                println!("Tier {idx}: retrying publish...");
+                if !dry_run {
+                    run_publish(root, config, idx, false)?;
+                }
+                set_tier_status(&mut wave, idx, TierStatus::Published, &crates);
+                save_wave(root, &wave)?;
+                println!("Tier {idx}: published!");
+                return Ok(());
+            }
+        }
+    }
+
+    save_wave(root, &wave)?;
+    println!("All tiers published! Wave complete.");
+    Ok(())
+}
+
+/// Get unique repo paths for crates in a tier
+fn tier_repo_paths(root: &Path, eco: &Ecosystem, crates: &[String]) -> Vec<(String, PathBuf)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut result = Vec::new();
+    for name in crates {
+        if let Some(info) = eco.crates.get(name.as_str()) {
+            if seen.insert(info.repo_dir.clone()) {
+                result.push((
+                    info.repo_dir.clone(),
+                    resolve_repo_path(root, &info.repo_dir),
+                ));
+            }
+        }
+    }
+    result
+}
+
+/// Get the latest CI run ID for a repo
+fn get_latest_run_id(repo_slug: &str) -> Option<String> {
+    let output = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--repo",
+            repo_slug,
+            "--limit",
+            "1",
+            "--json",
+            "databaseId",
+            "--jq",
+            ".[0].databaseId",
+        ])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !id.is_empty() && id != "null" {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Get CI conclusion for a repo's latest run
+fn get_run_conclusion(repo_slug: &str) -> Option<String> {
+    let output = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--repo",
+            repo_slug,
+            "--limit",
+            "1",
+            "--json",
+            "conclusion,status",
+            "--jq",
+            ".[0] | if .status == \"completed\" then .conclusion else .status end",
+        ])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
 }
 
 // ── Commands ──

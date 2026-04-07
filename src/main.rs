@@ -4,6 +4,7 @@ mod audit;
 mod bump;
 mod check;
 mod ci;
+mod ci_gen;
 mod ci_lint;
 mod config;
 mod dashboard;
@@ -169,6 +170,15 @@ enum Command {
         #[command(subcommand)]
         command: release::ReleaseCommand,
     },
+    /// Generate/sync CI workflow files across all repos from a template
+    CiGen {
+        /// Path to template file (default: ci-template.yml in workspace root)
+        #[arg(long)]
+        template: Option<String>,
+        /// Only repos matching this crate name glob
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Clone all ecosystem repos on a new machine
     Setup {
         /// Actually clone (default: dry-run showing what would be cloned)
@@ -279,6 +289,13 @@ fn main() {
         Command::Outdated { filter, deep } => {
             run::run_outdated(&root, &config, filter.as_deref(), deep)
         }
+        Command::CiGen { template, filter } => ci_gen::run(
+            &root,
+            &config,
+            template.as_deref(),
+            filter.as_deref(),
+            cli.dry_run,
+        ),
         Command::Release { command } => release::run(&root, &config, &command, cli.dry_run),
         Command::Setup { run, ssh } => run_setup(&root, &config, run, ssh),
         Command::FixDualSpec { filter, target } => fix_dual_spec::run(

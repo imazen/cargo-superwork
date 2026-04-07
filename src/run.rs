@@ -38,47 +38,99 @@ pub fn run_cmd(
             continue;
         }
 
-        // Within a level, repos are independent — could parallelize with `jobs`
-        // For now, sequential within level (parallel would need threads)
-        for (repo_dir, repo_path) in level_repos {
-            print!("[L{level}] {repo_dir}: ");
+        if jobs > 1 && level_repos.len() > 1 {
+            // Parallel execution within level
+            use std::sync::{Arc, Mutex};
+            use std::thread;
 
-            let result = run_shell_cmd(cmd, repo_path);
+            #[allow(clippy::type_complexity)]
+            let results_vec: Arc<Mutex<Vec<(String, Result<CmdOutput, String>)>>> =
+                Arc::new(Mutex::new(Vec::new()));
 
-            match result {
-                Ok(output) => {
-                    if output.success {
-                        println!("OK");
+            for chunk in level_repos.chunks(jobs) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|(repo_dir, repo_path)| {
+                        let cmd = cmd.to_string();
+                        let repo_dir = repo_dir.clone();
+                        let repo_path = repo_path.clone();
+                        let results_ref = Arc::clone(&results_vec);
+                        thread::spawn(move || {
+                            let result = run_shell_cmd(&cmd, &repo_path);
+                            results_ref.lock().unwrap().push((repo_dir, result));
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    let _ = h.join();
+                }
+            }
+
+            let batch = results_vec.lock().unwrap();
+            for (repo_dir, result) in batch.iter() {
+                match result {
+                    Ok(output) if output.success => {
+                        println!("[L{level}] {repo_dir}: OK");
                         successes += 1;
-                    } else {
-                        println!("FAIL (exit {})", output.code);
+                    }
+                    Ok(output) => {
+                        println!("[L{level}] {repo_dir}: FAIL (exit {})", output.code);
                         if !output.stderr_tail.is_empty() {
-                            for line in output.stderr_tail.lines().take(10) {
+                            for line in output.stderr_tail.lines().take(5) {
                                 println!("  {line}");
                             }
                         }
                         failures.push(repo_dir.clone());
-                        if fail_fast {
-                            println!();
-                            return Err(format!(
-                                "failed in {repo_dir} (exit {}). {successes} passed, 1 failed.",
-                                output.code
-                            ));
-                        }
+                    }
+                    Err(e) => {
+                        println!("[L{level}] {repo_dir}: ERROR: {e}");
+                        failures.push(repo_dir.clone());
                     }
                 }
-                Err(e) => {
-                    println!("ERROR: {e}");
-                    failures.push(repo_dir.clone());
-                    if fail_fast {
-                        return Err(format!("error in {repo_dir}: {e}"));
+            }
+            if fail_fast && !failures.is_empty() {
+                return Err(format!("{} repos failed", failures.len()));
+            }
+        } else {
+            // Sequential execution
+            for (repo_dir, repo_path) in level_repos {
+                print!("[L{level}] {repo_dir}: ");
+
+                let result = run_shell_cmd(cmd, repo_path);
+
+                match result {
+                    Ok(output) => {
+                        if output.success {
+                            println!("OK");
+                            successes += 1;
+                        } else {
+                            println!("FAIL (exit {})", output.code);
+                            if !output.stderr_tail.is_empty() {
+                                for line in output.stderr_tail.lines().take(10) {
+                                    println!("  {line}");
+                                }
+                            }
+                            failures.push(repo_dir.clone());
+                            if fail_fast {
+                                println!();
+                                return Err(format!(
+                                    "failed in {repo_dir} (exit {}). {successes} passed, 1 failed.",
+                                    output.code
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("ERROR: {e}");
+                        failures.push(repo_dir.clone());
+                        if fail_fast {
+                            return Err(format!("error in {repo_dir}: {e}"));
+                        }
                     }
                 }
             }
         }
     }
-
-    let _ = jobs; // TODO: parallel execution within levels
 
     println!();
     println!("{successes} passed, {} failed", failures.len());

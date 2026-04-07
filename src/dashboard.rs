@@ -1,5 +1,6 @@
 use crate::config::SuperworkConfig;
 use crate::discover;
+use crate::release;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -196,6 +197,19 @@ pub fn run(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
         total_unpushed,
         not_main,
     );
+
+    // Show active release wave if present
+    let wave = release::load_wave(root);
+    if !wave.tiers.is_empty() {
+        println!();
+        print!("Release wave:");
+        for (tier_key, ts) in &wave.tiers {
+            if !ts.crates.is_empty() {
+                print!("  T{tier_key}:{}", ts.status);
+            }
+        }
+        println!();
+    }
 
     Ok(())
 }
