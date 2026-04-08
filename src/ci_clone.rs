@@ -399,37 +399,95 @@ fn add_path_overrides_to_repo(
 }
 
 /// Compute the relative path from a manifest to a crate in a sibling dir.
-/// E.g., from `zenpipe/Cargo.toml` to `zenresize` → `"../zenresize"`
-/// For workspace members: from `zenjpeg/zenjpeg/Cargo.toml` to crate in
-/// `zenjpeg/zenjpeg/` → the path depends on the repo layout.
+/// For workspace repos, finds the actual crate directory by scanning
+/// the workspace members for a matching [package].name.
 fn compute_dep_path(
     manifest_path: &Path,
     _repo_dir: &Path,
     sibling_dir: &str,
-    _crate_name: &str,
+    crate_name: &str,
     _crate_to_repo: &BTreeMap<String, (String, String)>,
 ) -> Option<String> {
     let manifest_dir = manifest_path.parent()?;
     let parent = manifest_dir.parent()?;
-
-    // Simple case: sibling is a flat crate (../sibling)
     let sibling_path = parent.join(sibling_dir);
-    if sibling_path.join("Cargo.toml").exists() {
-        // Check if Cargo.toml has a [package] with the right name
-        let rel = pathdiff(manifest_dir, &sibling_path);
-        return Some(rel);
+
+    if !sibling_path.exists() {
+        return None;
     }
 
-    // Check if sibling is a workspace — look for the crate inside
-    if sibling_path.join("src").exists() || sibling_path.join("Cargo.toml").exists() {
-        let rel = pathdiff(manifest_dir, &sibling_path);
-        return Some(rel);
+    // Check if the root Cargo.toml IS the crate (not a virtual workspace)
+    let root_toml = sibling_path.join("Cargo.toml");
+    if root_toml.exists() {
+        if let Ok(content) = std::fs::read_to_string(&root_toml) {
+            if let Ok(doc) = content.parse::<toml::Value>() {
+                // Direct package match at root
+                if doc
+                    .get("package")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some(crate_name)
+                {
+                    return Some(pathdiff(manifest_dir, &sibling_path));
+                }
+
+                // Workspace — search members for the crate
+                if let Some(members) = doc
+                    .get("workspace")
+                    .and_then(|w| w.as_table())
+                    .and_then(|w| w.get("members"))
+                    .and_then(|m| m.as_array())
+                {
+                    for member in members {
+                        if let Some(member_str) = member.as_str() {
+                            // Handle globs
+                            if member_str.contains('*') {
+                                let prefix = member_str.split('*').next().unwrap_or("");
+                                let glob_dir = sibling_path.join(prefix);
+                                if let Ok(entries) = std::fs::read_dir(&glob_dir) {
+                                    for entry in entries.flatten() {
+                                        if let Some(p) = check_member_name(
+                                            &entry.path(),
+                                            crate_name,
+                                            manifest_dir,
+                                        ) {
+                                            return Some(p);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let member_path = sibling_path.join(member_str);
+                                if let Some(p) =
+                                    check_member_name(&member_path, crate_name, manifest_dir)
+                                {
+                                    return Some(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    // Workspace member: the crate might be in sibling_dir/crate_name or sibling_dir/crates/crate_name
-    // For now, just return the sibling dir path — cargo will resolve workspace members
-    let rel = pathdiff(manifest_dir, &sibling_path);
-    Some(rel)
+    // Fallback: just point to the sibling dir
+    Some(pathdiff(manifest_dir, &sibling_path))
+}
+
+/// Check if a workspace member directory contains a crate with the given name.
+fn check_member_name(member_dir: &Path, crate_name: &str, from_dir: &Path) -> Option<String> {
+    let toml_path = member_dir.join("Cargo.toml");
+    let content = std::fs::read_to_string(&toml_path).ok()?;
+    let doc: toml::Value = toml::from_str(&content).ok()?;
+    let name = doc
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name == crate_name {
+        Some(pathdiff(from_dir, member_dir))
+    } else {
+        None
+    }
 }
 
 fn pathdiff(from: &Path, to: &Path) -> String {
