@@ -247,12 +247,28 @@ fn add_path_overrides(
         .collect();
 
     for manifest_path in &manifests {
+        // Read the raw TOML to check which deps already have paths
+        let raw_content = std::fs::read_to_string(manifest_path).unwrap_or_default();
+        let raw_doc: toml::Value =
+            toml::from_str(&raw_content).unwrap_or(toml::Value::Table(Default::default()));
+
         let (_, mut doc) = manifest::read_manifest(manifest_path)?;
         let mut changes = 0;
 
         for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
             for crate_name in &crates_in_dir {
-                // Compute the relative path from this manifest to the crate in the sibling
+                // Skip deps that already have a path — don't overwrite correct paths
+                let already_has_path = raw_doc
+                    .get(section)
+                    .and_then(|s| s.as_table())
+                    .and_then(|t| t.get(*crate_name))
+                    .and_then(|d| d.as_table())
+                    .and_then(|t| t.get("path"))
+                    .is_some();
+                if already_has_path {
+                    continue;
+                }
+
                 let path = compute_dep_path(
                     manifest_path,
                     project_dir,
@@ -287,17 +303,30 @@ fn add_path_overrides_to_repo(
     let mut modified = 0;
 
     for manifest_path in &manifests {
+        let raw_content = std::fs::read_to_string(manifest_path).unwrap_or_default();
+        let raw_doc: toml::Value =
+            toml::from_str(&raw_content).unwrap_or(toml::Value::Table(Default::default()));
+
         let (_, mut doc) = manifest::read_manifest(manifest_path)?;
         let mut changes = 0;
 
         for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-            let Some(deps) = doc.get(section).and_then(|d| d.as_table()) else {
+            let Some(deps) = raw_doc.get(section).and_then(|d| d.as_table()) else {
                 continue;
             };
-            let dep_names: Vec<String> = deps.iter().map(|(k, _)| k.to_string()).collect();
+            let dep_names: Vec<String> = deps.keys().map(|k| k.to_string()).collect();
 
             for dep_name in &dep_names {
-                // Check if this dep is an ecosystem crate in an available dir
+                // Skip deps that already have paths
+                let already_has_path = deps
+                    .get(dep_name)
+                    .and_then(|d| d.as_table())
+                    .and_then(|t| t.get("path"))
+                    .is_some();
+                if already_has_path {
+                    continue;
+                }
+
                 if let Some((dir, _)) = crate_to_repo.get(dep_name.as_str()) {
                     if available_dirs.contains(dir) {
                         let path =
