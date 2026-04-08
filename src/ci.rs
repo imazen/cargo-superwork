@@ -225,38 +225,15 @@ pub fn run(
         // ecosystem siblings (other crates in the same git repos).
         // Using pre-computed patch_repos from config for URL lookups.
 
-        // Collect all repos referenced by stripped deps
-        let mut needed_repos: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for entries in patch_entries.values() {
-            for (_, url) in entries {
-                needed_repos.insert(url.clone());
-            }
-        }
-
-        // Build patch map: all crates from needed repos
+        // Include ALL crates from patch_repos. Cargo treats unused patches as
+        // warnings (not errors), and the transitive dep tree is hard to compute
+        // without the full ecosystem. Including everything is safe and correct.
         let mut all_patches: BTreeMap<String, String> = BTreeMap::new();
-
-        // From pre-computed list: include crates whose repo is in needed_repos
         for (name, url) in &config.ci.patch_repos {
-            if needed_repos.contains(url) {
-                all_patches.insert(name.clone(), url.clone());
-            }
+            all_patches.insert(name.clone(), url.clone());
         }
 
-        // From live ecosystem: same filter
-        for info in eco.crates.values() {
-            if !info.publishable || all_patches.contains_key(&info.name) {
-                continue;
-            }
-            if let Some(url) = dep_git_url(&info.name, None, &eco, config) {
-                if needed_repos.contains(&url) {
-                    all_patches.insert(info.name.clone(), url);
-                }
-            }
-        }
-
-        // Also add directly stripped deps (they may not be in the pre-computed list)
+        // Also add directly stripped deps (may not be in pre-computed list)
         for entries in patch_entries.values() {
             for (name, url) in entries {
                 all_patches
