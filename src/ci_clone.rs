@@ -536,14 +536,16 @@ fn add_path_overrides_to_repo(
 /// the workspace members for a matching [package].name.
 fn compute_dep_path(
     manifest_path: &Path,
-    _repo_dir: &Path,
+    repo_dir: &Path,
     sibling_dir: &str,
     crate_name: &str,
     _crate_to_repo: &BTreeMap<String, (String, String)>,
 ) -> Option<String> {
     let manifest_dir = manifest_path.parent()?;
-    let parent = manifest_dir.parent()?;
-    let sibling_path = parent.join(sibling_dir);
+    // The sibling is a sibling of the REPO root, not of the manifest dir.
+    // (For workspace members, the manifest dir is a subdirectory of the repo root.)
+    let repo_parent = repo_dir.parent()?;
+    let sibling_path = repo_parent.join(sibling_dir);
 
     if !sibling_path.exists() {
         return None;
