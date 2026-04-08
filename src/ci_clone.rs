@@ -195,14 +195,20 @@ fn collect_needed_dirs(
                     .and_then(|p| p.as_str())
                     .unwrap_or(dep_name);
 
-                // If this dep has a path already, extract the sibling dir
+                // If this dep has a path already, extract the sibling dir.
+                // But only if the target doesn't already exist — if it does,
+                // there's no need to clone (avoids collisions like zentiff).
                 if let Some(path) = dep_value
                     .as_table()
                     .and_then(|t| t.get("path"))
                     .and_then(|p| p.as_str())
                 {
-                    if let Some(dir) = extract_sibling_dir(path) {
-                        needed_dirs.insert(dir);
+                    let manifest_dir = manifest_path.parent().unwrap();
+                    let resolved = manifest_dir.join(path);
+                    if !resolved.exists() {
+                        if let Some(dir) = extract_sibling_dir(path) {
+                            needed_dirs.insert(dir);
+                        }
                     }
                 }
                 // If no path but the crate is in our ecosystem, we'll need its repo
@@ -231,8 +237,12 @@ fn collect_needed_dirs(
                     .and_then(|t| t.get("path"))
                     .and_then(|p| p.as_str())
                 {
-                    if let Some(dir) = extract_sibling_dir(path) {
-                        needed_dirs.insert(dir);
+                    let manifest_dir = manifest_path.parent().unwrap();
+                    let resolved = manifest_dir.join(path);
+                    if !resolved.exists() {
+                        if let Some(dir) = extract_sibling_dir(path) {
+                            needed_dirs.insert(dir);
+                        }
                     }
                 } else if let Some((dir, _)) = crate_to_repo.get(actual_name) {
                     needed_dirs.insert(dir.clone());
