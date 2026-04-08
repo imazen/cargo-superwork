@@ -34,9 +34,22 @@ pub fn run(
         println!("  deleted deps: {}", delete_deps.join(", "));
     }
 
+    // Build exclusion set: crates already provided by existing path deps in CWD.
+    // These shouldn't be cloned separately (avoids collisions).
+    let existing_path_crates = crates_with_existing_paths(&cwd);
+    let excluded_dirs: BTreeSet<String> = existing_path_crates
+        .iter()
+        .filter_map(|name| crate_to_repo.get(name.as_str()).map(|(dir, _)| dir.clone()))
+        .collect();
+
     // Phase 1: find which sibling dirs we need from the CWD project's deps.
     let mut needed_dirs: BTreeSet<String> = BTreeSet::new();
     collect_needed_dirs(&cwd, &crate_to_repo, &mut needed_dirs)?;
+
+    // Remove excluded dirs (provided by existing path deps)
+    for dir in &excluded_dirs {
+        needed_dirs.remove(dir);
+    }
 
     // Phase 2: clone, then recurse.
     let label = if dry_run { "[dry-run] " } else { "" };
@@ -168,6 +181,36 @@ fn build_crate_repo_map(config: &SuperworkConfig) -> BTreeMap<String, (String, S
 
 /// Scan Cargo.toml files in `repo_dir` for internal deps and add their
 /// sibling dirs to `needed_dirs`.
+/// Crate names that are already provided by existing path deps
+/// (shouldn't be cloned separately).
+fn crates_with_existing_paths(repo_dir: &Path) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    let manifests = find_manifests(repo_dir);
+    for mp in &manifests {
+        let content = std::fs::read_to_string(mp).unwrap_or_default();
+        let doc: toml::Value = match toml::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(deps) = doc.get(section).and_then(|d| d.as_table()) {
+                for (name, val) in deps {
+                    let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
+                    if has_path {
+                        let actual = val
+                            .as_table()
+                            .and_then(|t| t.get("package"))
+                            .and_then(|p| p.as_str())
+                            .unwrap_or(name);
+                        result.insert(actual.to_string());
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 fn collect_needed_dirs(
     repo_dir: &Path,
     crate_to_repo: &BTreeMap<String, (String, String)>,
