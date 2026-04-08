@@ -831,17 +831,16 @@ fn find_manifests(repo_dir: &Path) -> Vec<PathBuf> {
 
 /// Extract the sibling directory name from a relative path.
 fn extract_sibling_dir(path: &str) -> Option<String> {
-    let parts: Vec<&str> = path.split('/').collect();
+    // Skip all leading `..` segments, then take the first real dir name.
     // "../zenresize" → "zenresize"
     // "../zenjpeg/zenjpeg" → "zenjpeg"
     // "../../imageflow/imageflow_core" → "imageflow"
-    if parts.len() >= 2 && parts[0] == ".." && parts[1] != ".." {
-        Some(parts[1].to_string())
-    } else if parts.len() >= 3 && parts[0] == ".." && parts[1] == ".." {
-        Some(parts[2].to_string())
-    } else {
-        None
-    }
+    // "../../../enough/crates/enough" → "enough"
+    let parts: Vec<&str> = path.split('/').collect();
+    let first_real = parts
+        .iter()
+        .find(|p| **p != ".." && **p != "." && !p.is_empty())?;
+    Some((*first_real).to_string())
 }
 
 /// Find the git URL for a sibling directory name.
