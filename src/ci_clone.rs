@@ -475,8 +475,8 @@ fn compute_dep_path(
         }
     }
 
-    // Fallback: just point to the sibling dir
-    Some(pathdiff(manifest_dir, &sibling_path))
+    // No matching crate found — don't add a wrong path
+    None
 }
 
 /// Check if a workspace member directory contains a crate with the given name.
