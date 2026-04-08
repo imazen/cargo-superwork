@@ -102,6 +102,20 @@ pub fn run(
                 cloned += 1;
             }
 
+            // After cloning, check what crates this dir provides.
+            // Exclude their default dirs from further cloning (avoids collisions).
+            if target.exists() {
+                let provided = crates_provided_by_repo(&target);
+                for crate_name in &provided {
+                    if let Some((other_dir, _)) = crate_to_repo.get(crate_name.as_str()) {
+                        if other_dir != dir {
+                            excluded_dirs.insert(other_dir.clone());
+                            needed_dirs.remove(other_dir);
+                        }
+                    }
+                }
+            }
+
             // If --recursive, scan the cloned repo for its own deps and add to needed_dirs.
             if recursive && target.exists() {
                 collect_needed_dirs(&target, &crate_to_repo, &mut needed_dirs)?;
@@ -218,6 +232,27 @@ fn crates_with_resolved_paths(repo_dir: &Path) -> BTreeSet<String> {
                     }
                 }
             }
+        }
+    }
+    result
+}
+
+/// Return the set of crate names provided by a repo directory.
+fn crates_provided_by_repo(repo_dir: &Path) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    let manifests = find_manifests(repo_dir);
+    for mp in &manifests {
+        let content = std::fs::read_to_string(mp).unwrap_or_default();
+        let doc: toml::Value = match toml::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Some(name) = doc
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            result.insert(name.to_string());
         }
     }
     result
