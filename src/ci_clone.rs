@@ -212,8 +212,9 @@ fn build_crate_repo_map(config: &SuperworkConfig) -> BTreeMap<String, (String, S
 
 /// Scan Cargo.toml files in `repo_dir` for internal deps and add their
 /// sibling dirs to `needed_dirs`.
-/// Crate names that are already provided by existing INTRA-REPO path deps
-/// (path targets that already exist on disk — shouldn't be cloned separately).
+/// Crate names that are already provided and shouldn't be cloned:
+/// - Existing intra-repo path deps whose target exists on disk
+/// - Existing git deps (cargo fetches them directly)
 fn crates_with_resolved_paths(repo_dir: &Path) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let manifests = find_manifests(repo_dir);
@@ -227,19 +228,21 @@ fn crates_with_resolved_paths(repo_dir: &Path) -> BTreeSet<String> {
         for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
             if let Some(deps) = doc.get(section).and_then(|d| d.as_table()) {
                 for (name, val) in deps {
-                    if let Some(path) = val
-                        .as_table()
-                        .and_then(|t| t.get("path"))
-                        .and_then(|p| p.as_str())
-                    {
-                        // Only exclude if the path target actually EXISTS on disk
+                    let Some(tbl) = val.as_table() else {
+                        continue;
+                    };
+                    let actual = tbl.get("package").and_then(|p| p.as_str()).unwrap_or(name);
+
+                    // Git dep: cargo fetches directly
+                    if tbl.contains_key("git") {
+                        result.insert(actual.to_string());
+                        continue;
+                    }
+
+                    // Path dep whose target exists on disk
+                    if let Some(path) = tbl.get("path").and_then(|p| p.as_str()) {
                         let resolved = manifest_dir.join(path);
                         if resolved.exists() {
-                            let actual = val
-                                .as_table()
-                                .and_then(|t| t.get("package"))
-                                .and_then(|p| p.as_str())
-                                .unwrap_or(name);
                             result.insert(actual.to_string());
                         }
                     }
@@ -292,20 +295,21 @@ fn collect_needed_dirs(
                 continue;
             };
             for (dep_name, dep_value) in deps {
-                let actual_name = dep_value
-                    .as_table()
+                let tbl = dep_value.as_table();
+                let actual_name = tbl
                     .and_then(|t| t.get("package"))
                     .and_then(|p| p.as_str())
                     .unwrap_or(dep_name);
 
+                // Skip deps with git keys — cargo fetches them directly
+                if tbl.is_some_and(|t| t.contains_key("git")) {
+                    continue;
+                }
+
                 // If this dep has a path already, extract the sibling dir.
                 // But only if the target doesn't already exist — if it does,
                 // there's no need to clone (avoids collisions like zentiff).
-                if let Some(path) = dep_value
-                    .as_table()
-                    .and_then(|t| t.get("path"))
-                    .and_then(|p| p.as_str())
-                {
+                if let Some(path) = tbl.and_then(|t| t.get("path")).and_then(|p| p.as_str()) {
                     let manifest_dir = manifest_path.parent().unwrap();
                     let resolved = manifest_dir.join(path);
                     if !resolved.exists() {
@@ -385,15 +389,17 @@ fn add_path_overrides(
 
         for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
             for crate_name in &crates_in_dir {
-                // Skip deps that already have a path — don't overwrite correct paths
-                let already_has_path = raw_doc
+                let dep_entry = raw_doc
                     .get(section)
                     .and_then(|s| s.as_table())
                     .and_then(|t| t.get(*crate_name))
-                    .and_then(|d| d.as_table())
-                    .and_then(|t| t.get("path"))
-                    .is_some();
-                if already_has_path {
+                    .and_then(|d| d.as_table());
+
+                // Skip deps with existing path (don't overwrite correct paths)
+                // or existing git (can't have both path and git)
+                let skip =
+                    dep_entry.is_some_and(|t| t.contains_key("path") || t.contains_key("git"));
+                if skip {
                     continue;
                 }
 
@@ -447,13 +453,11 @@ fn add_path_overrides_to_repo(
             let dep_names: Vec<String> = deps.keys().map(|k| k.to_string()).collect();
 
             for dep_name in &dep_names {
-                // Skip deps that already have paths
-                let already_has_path = deps
-                    .get(dep_name)
-                    .and_then(|d| d.as_table())
-                    .and_then(|t| t.get("path"))
-                    .is_some();
-                if already_has_path {
+                // Skip deps that already have paths or git keys
+                let dep_entry = deps.get(dep_name).and_then(|d| d.as_table());
+                let skip =
+                    dep_entry.is_some_and(|t| t.contains_key("path") || t.contains_key("git"));
+                if skip {
                     continue;
                 }
 
