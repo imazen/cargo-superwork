@@ -36,7 +36,7 @@ pub fn run(
 
     // Build exclusion set: crates already provided by existing path deps in CWD.
     // These shouldn't be cloned separately (avoids collisions).
-    let existing_path_crates = crates_with_existing_paths(&cwd);
+    let existing_path_crates = crates_with_resolved_paths(&cwd);
     let excluded_dirs: BTreeSet<String> = existing_path_crates
         .iter()
         .filter_map(|name| crate_to_repo.get(name.as_str()).map(|(dir, _)| dir.clone()))
@@ -181,9 +181,9 @@ fn build_crate_repo_map(config: &SuperworkConfig) -> BTreeMap<String, (String, S
 
 /// Scan Cargo.toml files in `repo_dir` for internal deps and add their
 /// sibling dirs to `needed_dirs`.
-/// Crate names that are already provided by existing path deps
-/// (shouldn't be cloned separately).
-fn crates_with_existing_paths(repo_dir: &Path) -> BTreeSet<String> {
+/// Crate names that are already provided by existing INTRA-REPO path deps
+/// (path targets that already exist on disk — shouldn't be cloned separately).
+fn crates_with_resolved_paths(repo_dir: &Path) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let manifests = find_manifests(repo_dir);
     for mp in &manifests {
@@ -192,17 +192,25 @@ fn crates_with_existing_paths(repo_dir: &Path) -> BTreeSet<String> {
             Ok(d) => d,
             Err(_) => continue,
         };
+        let manifest_dir = mp.parent().unwrap();
         for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
             if let Some(deps) = doc.get(section).and_then(|d| d.as_table()) {
                 for (name, val) in deps {
-                    let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
-                    if has_path {
-                        let actual = val
-                            .as_table()
-                            .and_then(|t| t.get("package"))
-                            .and_then(|p| p.as_str())
-                            .unwrap_or(name);
-                        result.insert(actual.to_string());
+                    if let Some(path) = val
+                        .as_table()
+                        .and_then(|t| t.get("path"))
+                        .and_then(|p| p.as_str())
+                    {
+                        // Only exclude if the path target actually EXISTS on disk
+                        let resolved = manifest_dir.join(path);
+                        if resolved.exists() {
+                            let actual = val
+                                .as_table()
+                                .and_then(|t| t.get("package"))
+                                .and_then(|p| p.as_str())
+                                .unwrap_or(name);
+                            result.insert(actual.to_string());
+                        }
                     }
                 }
             }
