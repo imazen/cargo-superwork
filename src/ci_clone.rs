@@ -27,6 +27,13 @@ pub fn run(
     // Build crate_name → (repo_dir_name, git_url) from patch_repos + repo overrides.
     let crate_to_repo = build_crate_repo_map(config);
 
+    // Phase 0: delete deps listed in inline CI config (private/unavailable deps).
+    let delete_deps = read_delete_list(&cwd);
+    if !delete_deps.is_empty() && !dry_run {
+        delete_deps_from_project(&cwd, &delete_deps)?;
+        println!("  deleted deps: {}", delete_deps.join(", "));
+    }
+
     // Phase 1: find which sibling dirs we need from the CWD project's deps.
     let mut needed_dirs: BTreeSet<String> = BTreeSet::new();
     collect_needed_dirs(&cwd, &crate_to_repo, &mut needed_dirs)?;
@@ -114,14 +121,32 @@ pub fn run(
 }
 
 /// Build a map: crate_name → (sibling_dir_name, git_url).
+/// The dir name comes from the repo URL's last segment, which is the
+/// actual repo name (matching the directory it clones into).
 fn build_crate_repo_map(config: &SuperworkConfig) -> BTreeMap<String, (String, String)> {
     let mut map = BTreeMap::new();
+
+    // First pass: build URL → dir_name mapping from [[repo]] overrides
+    let mut url_to_dir: BTreeMap<String, String> = BTreeMap::new();
+    for r in &config.repo {
+        if let Some(gh) = &r.github {
+            let url = format!("https://github.com/{gh}");
+            let dir = r.dir.strip_prefix("../").unwrap_or(&r.dir).to_string();
+            url_to_dir.insert(url, dir);
+        }
+    }
+
     for (crate_name, url) in &config.ci.patch_repos {
-        let dir = url
-            .strip_prefix("https://github.com/")
-            .and_then(|s| s.split('/').nth(1))
-            .unwrap_or(crate_name);
-        map.insert(crate_name.clone(), (dir.to_string(), url.clone()));
+        // Use [[repo]] override dir if available, otherwise derive from URL
+        let dir = if let Some(d) = url_to_dir.get(url) {
+            d.clone()
+        } else {
+            url.strip_prefix("https://github.com/")
+                .and_then(|s| s.split('/').nth(1))
+                .unwrap_or(crate_name)
+                .to_string()
+        };
+        map.insert(crate_name.clone(), (dir, url.clone()));
     }
     map
 }
@@ -401,6 +426,60 @@ fn pathdiff(from: &Path, to: &Path) -> String {
         result.push(part);
     }
     result.to_string_lossy().to_string()
+}
+
+/// Read the delete list from [package.metadata.superwork.ci] or [workspace.metadata.superwork.ci].
+fn read_delete_list(project_dir: &Path) -> Vec<String> {
+    let root_toml = project_dir.join("Cargo.toml");
+    let content = std::fs::read_to_string(&root_toml).unwrap_or_default();
+    let doc: toml::Value = match toml::from_str(&content) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    // Check [package.metadata.superwork.ci.delete] and [workspace.metadata.superwork.ci.delete]
+    for base in ["package", "workspace"] {
+        if let Some(delete) = doc
+            .get(base)
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("superwork"))
+            .and_then(|s| s.get("ci"))
+            .and_then(|c| c.get("delete"))
+            .and_then(|d| d.as_array())
+        {
+            return delete
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+/// Delete deps from all manifests in the project, including feature references.
+fn delete_deps_from_project(project_dir: &Path, deps_to_delete: &[String]) -> Result<(), String> {
+    let manifests = find_manifests(project_dir);
+
+    for manifest_path in &manifests {
+        let (_, mut doc) = manifest::read_manifest(manifest_path)?;
+        let mut changes = 0;
+
+        for dep_name in deps_to_delete {
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if manifest::delete_dep(&mut doc, section, dep_name) {
+                    changes += 1;
+                }
+            }
+            changes += manifest::strip_dep_from_features(&mut doc, dep_name);
+        }
+
+        if changes > 0 {
+            manifest::write_manifest(manifest_path, &doc, false)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Find all Cargo.toml files in a repo (workspace root + members).
