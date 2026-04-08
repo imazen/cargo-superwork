@@ -610,10 +610,11 @@ fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
                 let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
                 let has_version = val.as_table().and_then(|t| t.get("version")).is_some()
                     || val.as_str().is_some();
-                if has_path && has_version {
-                    if manifest::set_dep_version(&mut doc, section, name, "*") {
-                        changes += 1;
-                    }
+                if has_path
+                    && has_version
+                    && manifest::set_dep_version(&mut doc, section, name, "*")
+                {
+                    changes += 1;
                 }
             }
         }
