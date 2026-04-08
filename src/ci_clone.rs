@@ -574,12 +574,21 @@ fn add_path_overrides_to_repo(
                                         if let Some(dep) = ws_deps.get_mut(dep_name.as_str()) {
                                             if let Some(tbl) = dep.as_inline_table_mut() {
                                                 if !tbl.contains_key("path") {
+                                                    // Remove git keys before adding path
+                                                    tbl.remove("git");
+                                                    tbl.remove("branch");
+                                                    tbl.remove("tag");
+                                                    tbl.remove("rev");
                                                     tbl.insert("path", path.as_str().into());
                                                     tbl.insert("version", "*".into());
                                                     changes += 1;
                                                 }
                                             } else if let Some(tbl) = dep.as_table_mut() {
                                                 if !tbl.contains_key("path") {
+                                                    tbl.remove("git");
+                                                    tbl.remove("branch");
+                                                    tbl.remove("tag");
+                                                    tbl.remove("rev");
                                                     tbl.insert(
                                                         "path",
                                                         toml_edit::value(path.as_str()),
