@@ -37,7 +37,7 @@ pub fn run(
     // Build exclusion set: crates already provided by existing path deps in CWD.
     // These shouldn't be cloned separately (avoids collisions).
     let existing_path_crates = crates_with_resolved_paths(&cwd);
-    let excluded_dirs: BTreeSet<String> = existing_path_crates
+    let mut excluded_dirs: BTreeSet<String> = existing_path_crates
         .iter()
         .filter_map(|name| crate_to_repo.get(name.as_str()).map(|(dir, _)| dir.clone()))
         .collect();
