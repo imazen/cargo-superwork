@@ -114,6 +114,17 @@ pub fn run(
             }
         }
 
+        // Also wildcard ALL existing path dep versions (not just newly added).
+        // Version mismatches between Cargo.toml and cloned repos cause errors
+        // even with path deps — cargo still checks version compatibility.
+        wildcard_all_path_dep_versions(&cwd)?;
+        for dir in &processed_dirs {
+            let target = parent.join(dir);
+            if target.exists() && target != cwd {
+                wildcard_all_path_dep_versions(&target)?;
+            }
+        }
+
         println!("{label}  pathed {pathed_files} manifests");
     }
 
@@ -568,6 +579,79 @@ fn delete_deps_from_project(project_dir: &Path, deps_to_delete: &[String]) -> Re
                 }
             }
             changes += manifest::strip_dep_from_features(&mut doc, dep_name);
+        }
+
+        if changes > 0 {
+            manifest::write_manifest(manifest_path, &doc, false)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Set version = "*" on all deps that have a path key.
+/// This prevents version mismatch errors between Cargo.toml declarations
+/// and actual cloned repo versions.
+fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
+    let manifests = find_manifests(repo_dir);
+
+    for manifest_path in &manifests {
+        let raw = std::fs::read_to_string(manifest_path).unwrap_or_default();
+        let raw_doc: toml::Value =
+            toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
+        let (_, mut doc) = manifest::read_manifest(manifest_path)?;
+        let mut changes = 0;
+
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            let Some(deps) = raw_doc.get(section).and_then(|d| d.as_table()) else {
+                continue;
+            };
+            for (name, val) in deps {
+                let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
+                let has_version = val.as_table().and_then(|t| t.get("version")).is_some()
+                    || val.as_str().is_some();
+                if has_path && has_version {
+                    if manifest::set_dep_version(&mut doc, section, name, "*") {
+                        changes += 1;
+                    }
+                }
+            }
+        }
+
+        // Also handle [workspace.dependencies]
+        if let Some(ws_deps) = raw_doc
+            .get("workspace")
+            .and_then(|w| w.as_table())
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.as_table())
+        {
+            for (name, val) in ws_deps {
+                let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
+                let has_version = val.as_table().and_then(|t| t.get("version")).is_some();
+                if has_path && has_version {
+                    // Navigate workspace.dependencies manually for toml_edit
+                    if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_mut()) {
+                        if let Some(ws_deps) = ws
+                            .get_mut("dependencies")
+                            .and_then(|d| d.as_table_like_mut())
+                        {
+                            if let Some(dep) = ws_deps.get_mut(name) {
+                                if let Some(tbl) = dep.as_inline_table_mut() {
+                                    if tbl.get("version").and_then(|v| v.as_str()) != Some("*") {
+                                        tbl.insert("version", "*".into());
+                                        changes += 1;
+                                    }
+                                } else if let Some(tbl) = dep.as_table_mut() {
+                                    if tbl.get("version").and_then(|v| v.as_str()) != Some("*") {
+                                        tbl.insert("version", toml_edit::value("*"));
+                                        changes += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if changes > 0 {
