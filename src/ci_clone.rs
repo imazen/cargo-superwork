@@ -105,6 +105,10 @@ pub fn run(
             // If --recursive, scan the cloned repo for its own deps and add to needed_dirs.
             if recursive && target.exists() {
                 collect_needed_dirs(&target, &crate_to_repo, &mut needed_dirs)?;
+                // Re-apply exclusions after each expansion
+                for excl in &excluded_dirs {
+                    needed_dirs.remove(excl);
+                }
             }
         }
     }
