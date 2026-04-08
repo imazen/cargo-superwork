@@ -278,6 +278,8 @@ fn add_path_overrides(
                 );
                 if let Some(path) = path {
                     if manifest::set_dep_path(&mut doc, section, crate_name, &path) {
+                        // Also set version to "*" so any version matches the cloned code
+                        manifest::set_dep_version(&mut doc, section, crate_name, "*");
                         changes += 1;
                     }
                 }
@@ -333,6 +335,7 @@ fn add_path_overrides_to_repo(
                             compute_dep_path(manifest_path, repo_dir, dir, dep_name, crate_to_repo);
                         if let Some(path) = path {
                             if manifest::set_dep_path(&mut doc, section, dep_name, &path) {
+                                manifest::set_dep_version(&mut doc, section, dep_name, "*");
                                 changes += 1;
                             }
                         }
@@ -368,6 +371,7 @@ fn add_path_overrides_to_repo(
                                             if let Some(tbl) = dep.as_inline_table_mut() {
                                                 if !tbl.contains_key("path") {
                                                     tbl.insert("path", path.as_str().into());
+                                                    tbl.insert("version", "*".into());
                                                     changes += 1;
                                                 }
                                             } else if let Some(tbl) = dep.as_table_mut() {
@@ -376,6 +380,7 @@ fn add_path_overrides_to_repo(
                                                         "path",
                                                         toml_edit::value(path.as_str()),
                                                     );
+                                                    tbl.insert("version", toml_edit::value("*"));
                                                     changes += 1;
                                                 }
                                             }
