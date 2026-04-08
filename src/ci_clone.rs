@@ -238,19 +238,14 @@ fn crates_with_resolved_paths(repo_dir: &Path) -> BTreeSet<String> {
                     };
                     let actual = tbl.get("package").and_then(|p| p.as_str()).unwrap_or(name);
 
-                    // Git dep: cargo fetches directly
-                    if tbl.contains_key("git") {
-                        result.insert(actual.to_string());
-                        continue;
-                    }
-
-                    // Path dep whose target exists on disk
+                    // Path dep whose target exists on disk (intra-repo)
                     if let Some(path) = tbl.get("path").and_then(|p| p.as_str()) {
                         let resolved = manifest_dir.join(path);
                         if resolved.exists() {
                             result.insert(actual.to_string());
                         }
                     }
+                    // Git deps: NOT excluded — we rewrite them to paths
                 }
             }
         }
@@ -409,13 +404,13 @@ fn add_path_overrides(
                     .and_then(|t| t.get(*crate_name))
                     .and_then(|d| d.as_table());
 
-                // Skip deps with existing path (don't overwrite correct paths)
-                // or existing git (can't have both path and git)
-                let skip =
-                    dep_entry.is_some_and(|t| t.contains_key("path") || t.contains_key("git"));
-                if skip {
+                // Skip deps with existing path
+                if dep_entry.is_some_and(|t| t.contains_key("path")) {
                     continue;
                 }
+
+                // Has git: rewrite to path
+                let has_git = dep_entry.is_some_and(|t| t.contains_key("git"));
 
                 let path = compute_dep_path(
                     manifest_path,
@@ -425,8 +420,27 @@ fn add_path_overrides(
                     crate_to_repo,
                 );
                 if let Some(path) = path {
+                    // Remove git key if present
+                    if has_git {
+                        if let Some(deps_mut) =
+                            doc.get_mut(section).and_then(|s| s.as_table_like_mut())
+                        {
+                            if let Some(dep) = deps_mut.get_mut(crate_name) {
+                                if let Some(t) = dep.as_inline_table_mut() {
+                                    t.remove("git");
+                                    t.remove("branch");
+                                    t.remove("tag");
+                                    t.remove("rev");
+                                } else if let Some(t) = dep.as_table_mut() {
+                                    t.remove("git");
+                                    t.remove("branch");
+                                    t.remove("tag");
+                                    t.remove("rev");
+                                }
+                            }
+                        }
+                    }
                     if manifest::set_dep_path(&mut doc, section, crate_name, &path) {
-                        // Also set version to "*" so any version matches the cloned code
                         manifest::set_dep_version(&mut doc, section, crate_name, "*");
                         changes += 1;
                     }
