@@ -130,17 +130,30 @@ pub fn run(
     // Phase 3: add path overrides AFTER all repos are cloned.
     // This ensures all sibling dirs exist when computing paths.
     if add_paths && !dry_run {
+        // Discover all available dirs — processed_dirs plus any pre-existing
+        // sibling repos (like ones referenced by existing path deps in CWD).
+        let mut available_dirs = processed_dirs.clone();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry.path().join("Cargo.toml").exists() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        available_dirs.insert(name.to_string());
+                    }
+                }
+            }
+        }
+
         // Add paths to the CWD project
-        for dir in &processed_dirs {
+        for dir in &available_dirs {
             let n = add_path_overrides(&cwd, dir, &crate_to_repo)?;
             pathed_files += n;
         }
 
-        // Add paths within each cloned repo, pointing to other cloned siblings
-        for dir in &processed_dirs {
+        // Add paths within each available repo, pointing to other available siblings
+        for dir in &available_dirs {
             let target = parent.join(dir);
             if target.exists() && target != cwd {
-                let n = add_path_overrides_to_repo(&target, &crate_to_repo, &processed_dirs)?;
+                let n = add_path_overrides_to_repo(&target, &crate_to_repo, &available_dirs)?;
                 pathed_files += n;
             }
         }
@@ -149,7 +162,7 @@ pub fn run(
         // Version mismatches between Cargo.toml and cloned repos cause errors
         // even with path deps — cargo still checks version compatibility.
         wildcard_all_path_dep_versions(&cwd)?;
-        for dir in &processed_dirs {
+        for dir in &available_dirs {
             let target = parent.join(dir);
             if target.exists() && target != cwd {
                 wildcard_all_path_dep_versions(&target)?;
