@@ -89,27 +89,31 @@ pub fn run(
                 cloned += 1;
             }
 
-            // If --add-paths, add path keys to the CWD project's Cargo.toml
-            // for deps that come from this cloned dir.
-            if add_paths && !dry_run {
-                let n = add_path_overrides(&cwd, dir, &crate_to_repo)?;
-                pathed_files += n;
-            }
-
             // If --recursive, scan the cloned repo for its own deps and add to needed_dirs.
             if recursive && target.exists() {
                 collect_needed_dirs(&target, &crate_to_repo, &mut needed_dirs)?;
-
-                // Also add paths within the cloned repo pointing to other cloned siblings.
-                if add_paths && !dry_run {
-                    let n = add_path_overrides_to_repo(&target, &crate_to_repo, &processed_dirs)?;
-                    pathed_files += n;
-                }
             }
         }
     }
 
+    // Phase 3: add path overrides AFTER all repos are cloned.
+    // This ensures all sibling dirs exist when computing paths.
     if add_paths && !dry_run {
+        // Add paths to the CWD project
+        for dir in &processed_dirs {
+            let n = add_path_overrides(&cwd, dir, &crate_to_repo)?;
+            pathed_files += n;
+        }
+
+        // Add paths within each cloned repo, pointing to other cloned siblings
+        for dir in &processed_dirs {
+            let target = parent.join(dir);
+            if target.exists() && target != cwd {
+                let n = add_path_overrides_to_repo(&target, &crate_to_repo, &processed_dirs)?;
+                pathed_files += n;
+            }
+        }
+
         println!("{label}  pathed {pathed_files} manifests");
     }
 
