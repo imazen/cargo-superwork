@@ -306,8 +306,17 @@ fn collect_needed_dirs(
                     .and_then(|p| p.as_str())
                     .unwrap_or(dep_name);
 
-                // Skip deps with git keys — cargo fetches them directly
-                if tbl.is_some_and(|t| t.contains_key("git")) {
+                // Git dep: clone the repo so we can rewrite to a path dep.
+                // (Git deps don't compose well — fetched repos have their own
+                // path deps that don't exist in CI.)
+                if let Some(git_url) = tbl.and_then(|t| t.get("git")).and_then(|g| g.as_str()) {
+                    if let Some(dir) = git_url
+                        .strip_prefix("https://github.com/")
+                        .and_then(|s| s.split('/').nth(1))
+                        .map(|s| s.trim_end_matches(".git").to_string())
+                    {
+                        needed_dirs.insert(dir);
+                    }
                     continue;
                 }
 
@@ -458,24 +467,68 @@ fn add_path_overrides_to_repo(
             let dep_names: Vec<String> = deps.keys().map(|k| k.to_string()).collect();
 
             for dep_name in &dep_names {
-                // Skip deps that already have paths or git keys
                 let dep_entry = deps.get(dep_name).and_then(|d| d.as_table());
-                let skip =
-                    dep_entry.is_some_and(|t| t.contains_key("path") || t.contains_key("git"));
-                if skip {
+
+                // Already has a path: skip
+                if dep_entry.is_some_and(|t| t.contains_key("path")) {
                     continue;
                 }
 
-                if let Some((dir, _)) = crate_to_repo.get(dep_name.as_str()) {
-                    if available_dirs.contains(dir) {
-                        let path =
-                            compute_dep_path(manifest_path, repo_dir, dir, dep_name, crate_to_repo);
-                        if let Some(path) = path {
-                            if manifest::set_dep_path(&mut doc, section, dep_name, &path) {
-                                manifest::set_dep_version(&mut doc, section, dep_name, "*");
-                                changes += 1;
+                // Has git key: rewrite to path if we have a sibling clone for it
+                let has_git = dep_entry.is_some_and(|t| t.contains_key("git"));
+                let actual_name = dep_entry
+                    .and_then(|t| t.get("package"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or(dep_name);
+
+                // Find the sibling dir from git URL or crate registry
+                let target_dir = if has_git {
+                    dep_entry
+                        .and_then(|t| t.get("git"))
+                        .and_then(|g| g.as_str())
+                        .and_then(|url| {
+                            url.strip_prefix("https://github.com/")
+                                .and_then(|s| s.split('/').nth(1))
+                                .map(|s| s.trim_end_matches(".git").to_string())
+                        })
+                } else {
+                    crate_to_repo.get(actual_name).map(|(d, _)| d.clone())
+                };
+
+                let Some(dir) = target_dir else {
+                    continue;
+                };
+
+                if !available_dirs.contains(&dir) {
+                    continue;
+                }
+
+                let path =
+                    compute_dep_path(manifest_path, repo_dir, &dir, actual_name, crate_to_repo);
+                if let Some(path) = path {
+                    // Remove git key first if present, then add path
+                    if has_git {
+                        if let Some(deps_mut) =
+                            doc.get_mut(section).and_then(|s| s.as_table_like_mut())
+                        {
+                            if let Some(dep) = deps_mut.get_mut(dep_name) {
+                                if let Some(t) = dep.as_inline_table_mut() {
+                                    t.remove("git");
+                                    t.remove("branch");
+                                    t.remove("tag");
+                                    t.remove("rev");
+                                } else if let Some(t) = dep.as_table_mut() {
+                                    t.remove("git");
+                                    t.remove("branch");
+                                    t.remove("tag");
+                                    t.remove("rev");
+                                }
                             }
                         }
+                    }
+                    if manifest::set_dep_path(&mut doc, section, dep_name, &path) {
+                        manifest::set_dep_version(&mut doc, section, dep_name, "*");
+                        changes += 1;
                     }
                 }
             }
