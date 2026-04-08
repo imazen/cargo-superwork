@@ -346,11 +346,8 @@ fn scan_single_crate(
         .ok_or_else(|| format!("no package.name in {}", manifest_path.display()))?
         .to_string();
 
-    let version = package
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0.0.0")
-        .to_string();
+    let version = resolve_package_version(package, &doc, workspace_root)
+        .unwrap_or_else(|| "0.0.0".to_string());
 
     // Check publish field
     let has_publish_false = package
@@ -584,6 +581,47 @@ fn extract_version(v: &toml::Value) -> (bool, Option<String>) {
         }
     }
     (false, None)
+}
+
+/// Resolve `[package].version`, following `version.workspace = true` into the
+/// workspace root's `[workspace.package].version` when necessary.
+///
+/// The workspace root is either a separate file (for a member crate), or the
+/// current manifest itself (when a workspace root is also a package).
+fn resolve_package_version(
+    package: &toml::value::Table,
+    current_doc: &toml::Value,
+    workspace_root: Option<&Path>,
+) -> Option<String> {
+    match package.get("version") {
+        Some(toml::Value::String(s)) => Some(s.clone()),
+        Some(toml::Value::Table(t)) => {
+            let is_ws_ref = t
+                .get("workspace")
+                .and_then(|w| w.as_bool())
+                .unwrap_or(false);
+            if !is_ws_ref {
+                return None;
+            }
+            // Either read from the external workspace root, or fall back to
+            // [workspace.package] in the current doc (root-is-also-a-package case).
+            let ws_doc_owned;
+            let ws_doc: &toml::Value = if let Some(ws_path) = workspace_root {
+                let content = std::fs::read_to_string(ws_path).ok()?;
+                ws_doc_owned = toml::from_str::<toml::Value>(&content).ok()?;
+                &ws_doc_owned
+            } else {
+                current_doc
+            };
+            ws_doc
+                .get("workspace")?
+                .get("package")?
+                .get("version")?
+                .as_str()
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn extract_path(v: &toml::Value) -> (bool, Option<String>) {
