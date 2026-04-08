@@ -4,6 +4,7 @@ mod audit;
 mod bump;
 mod check;
 mod ci;
+mod ci_clone;
 mod ci_gen;
 mod ci_lint;
 mod config;
@@ -170,6 +171,15 @@ enum Command {
         #[command(subcommand)]
         command: release::ReleaseCommand,
     },
+    /// Clone dependency repos as siblings so path deps resolve in CI
+    CiClone {
+        /// Add path keys to version-only deps (use cloned source instead of crates.io)
+        #[arg(long)]
+        add_paths: bool,
+        /// Expand transitively: clone deps of deps, patch their manifests too
+        #[arg(long)]
+        recursive: bool,
+    },
     /// Print [patch.crates-io] entries for all ecosystem crates (for CI config)
     CiPatchList,
     /// Generate/sync CI workflow files across all repos from a template
@@ -291,6 +301,10 @@ fn main() {
         Command::Outdated { filter, deep } => {
             run::run_outdated(&root, &config, filter.as_deref(), deep)
         }
+        Command::CiClone {
+            add_paths,
+            recursive,
+        } => ci_clone::run(&root, &config, add_paths, recursive, cli.dry_run),
         Command::CiPatchList => ci::run_patch_list(&root, &config),
         Command::CiGen { template, filter } => ci_gen::run(
             &root,
