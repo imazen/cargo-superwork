@@ -27,11 +27,16 @@ pub fn run(
     // Build crate_name → (repo_dir_name, git_url) from patch_repos + repo overrides.
     let crate_to_repo = build_crate_repo_map(config);
 
-    // Phase 0: delete deps listed in inline CI config (private/unavailable deps).
+    // Phase 0: delete deps and sections listed in inline CI config.
     let delete_deps = read_delete_list(&cwd);
     if !delete_deps.is_empty() && !dry_run {
         delete_deps_from_project(&cwd, &delete_deps)?;
         println!("  deleted deps: {}", delete_deps.join(", "));
+    }
+    let delete_secs = read_delete_sections(&cwd);
+    if !delete_secs.is_empty() && !dry_run {
+        delete_sections_from_project(&cwd, &delete_secs)?;
+        println!("  deleted sections: {}", delete_secs.join(", "));
     }
 
     // Build exclusion set: crates already provided by existing path deps in CWD.
@@ -656,6 +661,15 @@ fn pathdiff(from: &Path, to: &Path) -> String {
 
 /// Read the delete list from [package.metadata.superwork.ci] or [workspace.metadata.superwork.ci].
 fn read_delete_list(project_dir: &Path) -> Vec<String> {
+    read_metadata_array(project_dir, "delete")
+}
+
+/// Read the delete_sections list (e.g., to remove [patch.crates-io] in CI).
+fn read_delete_sections(project_dir: &Path) -> Vec<String> {
+    read_metadata_array(project_dir, "delete_sections")
+}
+
+fn read_metadata_array(project_dir: &Path, key: &str) -> Vec<String> {
     let root_toml = project_dir.join("Cargo.toml");
     let content = std::fs::read_to_string(&root_toml).unwrap_or_default();
     let doc: toml::Value = match toml::from_str(&content) {
@@ -663,17 +677,16 @@ fn read_delete_list(project_dir: &Path) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
 
-    // Check [package.metadata.superwork.ci.delete] and [workspace.metadata.superwork.ci.delete]
     for base in ["package", "workspace"] {
-        if let Some(delete) = doc
+        if let Some(arr) = doc
             .get(base)
             .and_then(|p| p.get("metadata"))
             .and_then(|m| m.get("superwork"))
             .and_then(|s| s.get("ci"))
-            .and_then(|c| c.get("delete"))
+            .and_then(|c| c.get(key))
             .and_then(|d| d.as_array())
         {
-            return delete
+            return arr
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
@@ -681,6 +694,31 @@ fn read_delete_list(project_dir: &Path) -> Vec<String> {
     }
 
     Vec::new()
+}
+
+/// Delete sections (e.g., patch.crates-io) from project manifests.
+fn delete_sections_from_project(
+    project_dir: &Path,
+    sections_to_delete: &[String],
+) -> Result<(), String> {
+    let manifests = find_manifests(project_dir);
+
+    for manifest_path in &manifests {
+        let (_, mut doc) = manifest::read_manifest(manifest_path)?;
+        let mut changes = 0;
+
+        for section in sections_to_delete {
+            if manifest::delete_section(&mut doc, section) {
+                changes += 1;
+            }
+        }
+
+        if changes > 0 {
+            manifest::write_manifest(manifest_path, &doc, false)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Delete deps from all manifests in the project, including feature references.
