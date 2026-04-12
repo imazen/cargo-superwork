@@ -404,9 +404,15 @@ fn add_path_overrides(
                     .and_then(|t| t.get(*crate_name))
                     .and_then(|d| d.as_table());
 
-                // Skip deps with existing path
-                if dep_entry.is_some_and(|t| t.contains_key("path")) {
-                    continue;
+                // Skip deps with existing intra-workspace path (resolves within repo).
+                // Cross-repo paths (outside repo root) should be rewritten.
+                if let Some(existing_path) = dep_entry
+                    .and_then(|t| t.get("path"))
+                    .and_then(|p| p.as_str())
+                {
+                    if is_intra_repo_path(manifest_path, existing_path, project_dir) {
+                        continue;
+                    }
                 }
 
                 // Has git: rewrite to path
@@ -483,9 +489,15 @@ fn add_path_overrides_to_repo(
             for dep_name in &dep_names {
                 let dep_entry = deps.get(dep_name).and_then(|d| d.as_table());
 
-                // Already has a path: skip
-                if dep_entry.is_some_and(|t| t.contains_key("path")) {
-                    continue;
+                // Skip deps with existing intra-workspace path (resolves within repo).
+                // Cross-repo paths (outside repo root) should be rewritten.
+                if let Some(existing_path) = dep_entry
+                    .and_then(|t| t.get("path"))
+                    .and_then(|p| p.as_str())
+                {
+                    if is_intra_repo_path(manifest_path, existing_path, repo_dir) {
+                        continue;
+                    }
                 }
 
                 // Has git key: rewrite to path if we have a sibling clone for it
@@ -572,8 +584,21 @@ fn add_path_overrides_to_repo(
                                         .and_then(|d| d.as_table_like_mut())
                                     {
                                         if let Some(dep) = ws_deps.get_mut(dep_name.as_str()) {
-                                            if let Some(tbl) = dep.as_inline_table_mut() {
-                                                if !tbl.contains_key("path") {
+                                            // Skip if existing path resolves within repo
+                                            let skip = dep
+                                                .as_inline_table()
+                                                .and_then(|t| t.get("path"))
+                                                .and_then(|v| v.as_str())
+                                                .or_else(|| {
+                                                    dep.as_table()
+                                                        .and_then(|t| t.get("path"))
+                                                        .and_then(|v| v.as_str())
+                                                })
+                                                .is_some_and(|p| {
+                                                    is_intra_repo_path(manifest_path, p, repo_dir)
+                                                });
+                                            if !skip {
+                                                if let Some(tbl) = dep.as_inline_table_mut() {
                                                     // Remove git keys before adding path
                                                     tbl.remove("git");
                                                     tbl.remove("branch");
@@ -582,9 +607,7 @@ fn add_path_overrides_to_repo(
                                                     tbl.insert("path", path.as_str().into());
                                                     tbl.insert("version", "*".into());
                                                     changes += 1;
-                                                }
-                                            } else if let Some(tbl) = dep.as_table_mut() {
-                                                if !tbl.contains_key("path") {
+                                                } else if let Some(tbl) = dep.as_table_mut() {
                                                     tbl.remove("git");
                                                     tbl.remove("branch");
                                                     tbl.remove("tag");
@@ -840,10 +863,16 @@ fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
                 continue;
             };
             for (name, val) in deps {
-                let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
+                let dep_path = val
+                    .as_table()
+                    .and_then(|t| t.get("path"))
+                    .and_then(|p| p.as_str());
                 let has_version = val.as_table().and_then(|t| t.get("version")).is_some()
                     || val.as_str().is_some();
-                if has_path
+                // Only wildcard cross-repo path deps; preserve intra-workspace versions.
+                let is_cross_repo =
+                    dep_path.is_some_and(|p| !is_intra_repo_path(manifest_path, p, repo_dir));
+                if is_cross_repo
                     && has_version
                     && manifest::set_dep_version(&mut doc, section, name, "*")
                 {
@@ -860,9 +889,15 @@ fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
             .and_then(|d| d.as_table())
         {
             for (name, val) in ws_deps {
-                let has_path = val.as_table().and_then(|t| t.get("path")).is_some();
+                let dep_path = val
+                    .as_table()
+                    .and_then(|t| t.get("path"))
+                    .and_then(|p| p.as_str());
                 let has_version = val.as_table().and_then(|t| t.get("version")).is_some();
-                if has_path && has_version {
+                // Only wildcard cross-repo path deps; preserve intra-workspace versions.
+                let is_cross_repo =
+                    dep_path.is_some_and(|p| !is_intra_repo_path(manifest_path, p, repo_dir));
+                if is_cross_repo && has_version {
                     // Navigate workspace.dependencies manually for toml_edit
                     if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_mut()) {
                         if let Some(ws_deps) = ws
@@ -941,6 +976,43 @@ fn find_manifests(repo_dir: &Path) -> Vec<PathBuf> {
     }
 
     manifests
+}
+
+/// Check whether a path dependency resolves within the given repo root.
+/// Returns true if the resolved path is inside repo_dir (intra-workspace),
+/// false if it escapes (cross-repo) or cannot be resolved.
+fn is_intra_repo_path(manifest_path: &Path, dep_path: &str, repo_dir: &Path) -> bool {
+    let manifest_dir = match manifest_path.parent() {
+        Some(d) => d,
+        None => return false,
+    };
+    let resolved = manifest_dir.join(dep_path);
+    // Try canonicalize first; fall back to lexical normalization if the target
+    // doesn't exist on disk (e.g., the dep hasn't been cloned yet).
+    let resolved = resolved
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path(&resolved));
+    let repo_root = repo_dir
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path(repo_dir));
+    resolved.starts_with(&repo_root)
+}
+
+/// Lexically normalize a path (resolve `.` and `..` without touching the filesystem).
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
 }
 
 /// Extract the sibling directory name from a relative path.
