@@ -11,6 +11,7 @@ mod config;
 mod dashboard;
 mod discover;
 mod fix_dual_spec;
+mod gh_dashboard;
 mod graph;
 mod manifest;
 mod patch;
@@ -87,6 +88,8 @@ enum Command {
     Worktrees,
     /// Unified dashboard: branch, CI, dirty, unpushed in one table
     Dashboard,
+    /// GitHub ecosystem overview via single GraphQL call: CI, PRs, issues
+    GhDashboard,
     /// Generate "Image tech I maintain" ecosystem links section for READMEs
     ReadmeLinks {
         /// Crate to generate links for (highlights it in the table)
@@ -249,6 +252,7 @@ fn main() {
         Command::Status => status::run(&root, &config),
         Command::Worktrees => status::run_worktrees(&root, &config),
         Command::Dashboard => dashboard::run(&root, &config),
+        Command::GhDashboard => gh_dashboard::run(&root, &config),
         Command::ReadmeLinks { crate_name } => {
             readme_links::run(&root, &config, crate_name.as_deref())
         }
