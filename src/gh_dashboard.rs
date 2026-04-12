@@ -26,7 +26,6 @@ struct RepoResult {
 }
 
 struct PrInfo {
-    repo: String,
     number: u64,
     branch: String,
     title: String,
@@ -34,7 +33,6 @@ struct PrInfo {
 }
 
 struct IssueInfo {
-    repo: String,
     number: u64,
     title: String,
 }
@@ -90,101 +88,70 @@ pub fn run(root: &Path, config: &SuperworkConfig) -> Result<(), String> {
     // Sort alphabetically
     all_results.sort_by(|a, b| a.display.cmp(&b.display));
 
-    // Print table
-    let name_w = all_results
-        .iter()
-        .map(|r| r.display.len())
-        .max()
-        .unwrap_or(4)
-        .max(4)
-        + 1;
-
-    println!(
-        "{:<name_w$}  {:<4}  {:<4}  {:<6}",
-        "Repo", "CI", "PRs", "Issues"
-    );
-    println!("{}", "-".repeat(name_w + 20));
-
     let mut ci_green = 0u32;
     let mut ci_red = 0u32;
+    let mut ci_pending = 0u32;
+    let mut ci_none = 0u32;
     let mut total_prs = 0u64;
     let mut total_issues = 0u64;
-    let mut all_prs: Vec<&PrInfo> = Vec::new();
-    let mut all_issues: Vec<&IssueInfo> = Vec::new();
 
+    // Print grouped per-repo output with multiple line items
     for r in &all_results {
         let ci_icon = match r.ci_state.as_deref() {
             Some("SUCCESS") => {
                 ci_green += 1;
-                "\u{2705}" // check mark
+                "\u{2705}"
             }
-            Some("PENDING") | Some("EXPECTED") => "\u{23f3}", // hourglass
+            Some("PENDING") | Some("EXPECTED") => {
+                ci_pending += 1;
+                "\u{23f3}"
+            }
             Some("FAILURE") | Some("ERROR") => {
                 ci_red += 1;
-                "\u{274c}" // X
+                "\u{274c}"
             }
-            None => "\u{2014}", // em dash (no CI)
+            None => {
+                ci_none += 1;
+                "\u{2014}"
+            }
             Some(_) => {
                 ci_red += 1;
                 "\u{274c}"
             }
         };
 
-        let pr_str = if r.pr_count > 0 {
-            r.pr_count.to_string()
-        } else {
-            "-".to_string()
-        };
-        let issue_str = if r.issue_count > 0 {
-            r.issue_count.to_string()
-        } else {
-            "-".to_string()
-        };
-
         total_prs += r.pr_count;
         total_issues += r.issue_count;
 
+        // Skip repos with no activity and green/no CI
+        let has_activity = r.pr_count > 0 || r.issue_count > 0;
+        let is_red = matches!(r.ci_state.as_deref(), Some("FAILURE") | Some("ERROR"));
+        if !has_activity && !is_red {
+            continue;
+        }
+
+        println!("{} {}", ci_icon, r.display);
+
         for pr in &r.prs {
-            all_prs.push(pr);
-        }
-        for issue in &r.issues {
-            all_issues.push(issue);
-        }
-
-        println!(
-            "{:<name_w$}  {:<4}  {:<4}  {:<6}",
-            r.display, ci_icon, pr_str, issue_str
-        );
-    }
-
-    // Open PRs section
-    if !all_prs.is_empty() {
-        println!();
-        println!("Open PRs ({total_prs}):");
-        for pr in &all_prs {
             println!(
-                "  {}#{} [{}] {} (@{})",
-                pr.repo, pr.number, pr.branch, pr.title, pr.author
+                "    PR #{} [{}] {} (@{})",
+                pr.number, pr.branch, pr.title, pr.author
             );
         }
-    }
-
-    // Open Issues section
-    if !all_issues.is_empty() {
-        println!();
-        println!("Open Issues ({total_issues}):");
-        for issue in &all_issues {
-            println!("  {}#{} {}", issue.repo, issue.number, issue.title);
+        for issue in &r.issues {
+            println!("    #{} {}", issue.number, issue.title);
         }
     }
 
     // Summary
     println!();
     println!(
-        "{} repos  |  {} green, {} red  |  {} PRs  |  {} issues",
+        "{} repos  |  {} green, {} red, {} pending, {} no-CI  |  {} PRs  |  {} issues",
         all_results.len(),
         ci_green,
         ci_red,
+        ci_pending,
+        ci_none,
         total_prs,
         total_issues
     );
@@ -346,7 +313,6 @@ fn parse_results(
                 _ => "?".to_string(),
             };
             prs.push(PrInfo {
-                repo: repo.display.clone(),
                 number,
                 branch,
                 title,
@@ -371,11 +337,7 @@ fn parse_results(
                 JsonValue::Str(s) => s,
                 _ => String::new(),
             };
-            issues.push(IssueInfo {
-                repo: repo.display.clone(),
-                number,
-                title,
-            });
+            issues.push(IssueInfo { number, title });
         }
 
         results.push(RepoResult {
