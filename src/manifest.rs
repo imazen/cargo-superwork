@@ -90,12 +90,10 @@ pub fn replace_path_with_git(
     false
 }
 
-/// Add or update a `path` key on a dependency entry.
+/// Add or update a `path` key on a dependency entry inside an existing
+/// `&mut dyn TableLike` representing the section (`[dependencies]` etc.).
 /// Returns true if a change was made.
-pub fn set_dep_path(doc: &mut DocumentMut, section: &str, dep_name: &str, path: &str) -> bool {
-    let Some(deps) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) else {
-        return false;
-    };
+fn set_path_on_deps_table(deps: &mut dyn toml_edit::TableLike, dep_name: &str, path: &str) -> bool {
     let Some(dep) = deps.get_mut(dep_name) else {
         return false;
     };
@@ -124,6 +122,42 @@ pub fn set_dep_path(doc: &mut DocumentMut, section: &str, dep_name: &str, path: 
         return true;
     }
     false
+}
+
+/// Add or update a `path` key on a dependency entry.
+/// Returns true if a change was made.
+pub fn set_dep_path(doc: &mut DocumentMut, section: &str, dep_name: &str, path: &str) -> bool {
+    let Some(deps) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) else {
+        return false;
+    };
+    set_path_on_deps_table(deps, dep_name, path)
+}
+
+/// Like [`set_dep_path`] but for `[target.<spec>.<section>]` sections.
+/// Returns true if a change was made.
+pub fn set_target_dep_path(
+    doc: &mut DocumentMut,
+    target_spec: &str,
+    section: &str,
+    dep_name: &str,
+    path: &str,
+) -> bool {
+    let Some(target) = doc.get_mut("target").and_then(|t| t.as_table_like_mut()) else {
+        return false;
+    };
+    let Some(target_entry) = target
+        .get_mut(target_spec)
+        .and_then(|t| t.as_table_like_mut())
+    else {
+        return false;
+    };
+    let Some(deps) = target_entry
+        .get_mut(section)
+        .and_then(|s| s.as_table_like_mut())
+    else {
+        return false;
+    };
+    set_path_on_deps_table(deps, dep_name, path)
 }
 
 /// Delete an entire dependency entry from a section.
@@ -317,16 +351,11 @@ pub fn set_package_version(doc: &mut DocumentMut, version: &str) -> bool {
     false
 }
 
-/// Update the version in a dependency entry (in any section).
-pub fn set_dep_version(
-    doc: &mut DocumentMut,
-    section: &str,
+fn set_version_on_deps_table(
+    deps: &mut dyn toml_edit::TableLike,
     dep_name: &str,
     version: &str,
 ) -> bool {
-    let Some(deps) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) else {
-        return false;
-    };
     let Some(dep) = deps.get_mut(dep_name) else {
         return false;
     };
@@ -361,4 +390,43 @@ pub fn set_dep_version(
         return true;
     }
     false
+}
+
+/// Update the version in a dependency entry (in any section).
+pub fn set_dep_version(
+    doc: &mut DocumentMut,
+    section: &str,
+    dep_name: &str,
+    version: &str,
+) -> bool {
+    let Some(deps) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) else {
+        return false;
+    };
+    set_version_on_deps_table(deps, dep_name, version)
+}
+
+/// Like [`set_dep_version`] but for `[target.<spec>.<section>]` sections.
+pub fn set_target_dep_version(
+    doc: &mut DocumentMut,
+    target_spec: &str,
+    section: &str,
+    dep_name: &str,
+    version: &str,
+) -> bool {
+    let Some(target) = doc.get_mut("target").and_then(|t| t.as_table_like_mut()) else {
+        return false;
+    };
+    let Some(target_entry) = target
+        .get_mut(target_spec)
+        .and_then(|t| t.as_table_like_mut())
+    else {
+        return false;
+    };
+    let Some(deps) = target_entry
+        .get_mut(section)
+        .and_then(|s| s.as_table_like_mut())
+    else {
+        return false;
+    };
+    set_version_on_deps_table(deps, dep_name, version)
 }

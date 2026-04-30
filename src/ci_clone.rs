@@ -372,6 +372,97 @@ fn collect_needed_dirs(
 
 /// Add `path = "../{dir}/..."` to deps in the CWD project that reference
 /// crates from the given sibling dir.
+/// All `(target_spec, section)` dep-section locations that exist in `raw_doc`.
+/// `target_spec = None` represents the top-level `[dependencies]` etc.;
+/// `Some(spec)` represents `[target.<spec>.dependencies]` etc.
+fn dep_section_locations(raw_doc: &toml::Value) -> Vec<(Option<String>, &'static str)> {
+    let mut out: Vec<(Option<String>, &'static str)> = Vec::new();
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if raw_doc.get(section).and_then(|s| s.as_table()).is_some() {
+            out.push((None, section));
+        }
+    }
+    if let Some(target) = raw_doc.get("target").and_then(|t| t.as_table()) {
+        for (target_spec, target_table) in target.iter() {
+            let Some(target_table) = target_table.as_table() else {
+                continue;
+            };
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if target_table
+                    .get(section)
+                    .and_then(|s| s.as_table())
+                    .is_some()
+                {
+                    out.push((Some(target_spec.clone()), section));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Look up a `[<section>]` or `[target.<spec>.<section>]` entry in the raw
+/// (read-only) manifest TOML.
+fn raw_dep_table<'a>(
+    raw_doc: &'a toml::Value,
+    target_spec: Option<&str>,
+    section: &str,
+) -> Option<&'a toml::map::Map<String, toml::Value>> {
+    match target_spec {
+        None => raw_doc.get(section).and_then(|s| s.as_table()),
+        Some(spec) => raw_doc
+            .get("target")
+            .and_then(|t| t.as_table())
+            .and_then(|t| t.get(spec))
+            .and_then(|t| t.as_table())
+            .and_then(|t| t.get(section))
+            .and_then(|s| s.as_table()),
+    }
+}
+
+/// Strip git-coordinate keys from a dep entry. Used after we know we'll be
+/// adding a `path`. Walks `[<section>]` or `[target.<spec>.<section>]`
+/// based on `target_spec`.
+fn strip_git_keys_from_dep(
+    doc: &mut toml_edit::DocumentMut,
+    target_spec: Option<&str>,
+    section: &str,
+    dep_name: &str,
+) {
+    let deps_mut: Option<&mut dyn toml_edit::TableLike> = match target_spec {
+        None => doc.get_mut(section).and_then(|s| s.as_table_like_mut()),
+        Some(spec) => {
+            let target = doc.get_mut("target").and_then(|t| t.as_table_like_mut());
+            target
+                .and_then(|t| t.get_mut(spec).and_then(|x| x.as_table_like_mut()))
+                .and_then(|t| t.get_mut(section).and_then(|s| s.as_table_like_mut()))
+        }
+    };
+    let Some(deps_mut) = deps_mut else {
+        return;
+    };
+    let Some(dep) = deps_mut.get_mut(dep_name) else {
+        return;
+    };
+    if let Some(t) = dep.as_inline_table_mut() {
+        t.remove("git");
+        t.remove("branch");
+        t.remove("tag");
+        t.remove("rev");
+    } else if let Some(t) = dep.as_table_mut() {
+        t.remove("git");
+        t.remove("branch");
+        t.remove("tag");
+        t.remove("rev");
+    }
+}
+
+/// Tag whether a dep name was rewritten in some section. Lets us produce a
+/// hard error if `[dependencies] foo = path = "X"` is established but
+/// `[target.cfg(...)].dev-dependencies] foo = "0.2"` (no path) is still
+/// present elsewhere — cargo will reject this with "different source paths
+/// depending on the build target". The caller iterates every section in
+/// `dep_section_locations` so we surface mismatches consistently.
 fn add_path_overrides(
     project_dir: &Path,
     sibling_dir: &str,
@@ -396,13 +487,15 @@ fn add_path_overrides(
         let (_, mut doc) = manifest::read_manifest(manifest_path)?;
         let mut changes = 0;
 
-        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        for (target_spec, section) in dep_section_locations(&raw_doc) {
             for crate_name in &crates_in_dir {
-                let dep_entry = raw_doc
-                    .get(section)
-                    .and_then(|s| s.as_table())
-                    .and_then(|t| t.get(*crate_name))
-                    .and_then(|d| d.as_table());
+                let Some(deps) = raw_dep_table(&raw_doc, target_spec.as_deref(), section) else {
+                    continue;
+                };
+                let dep_entry = deps.get(*crate_name).and_then(|d| d.as_table());
+                let Some(_) = dep_entry else {
+                    continue;
+                };
 
                 // Skip deps with existing intra-workspace path (resolves within repo).
                 // Cross-repo paths (outside repo root) should be rewritten.
@@ -426,28 +519,37 @@ fn add_path_overrides(
                     crate_to_repo,
                 );
                 if let Some(path) = path {
-                    // Remove git key if present
                     if has_git {
-                        if let Some(deps_mut) =
-                            doc.get_mut(section).and_then(|s| s.as_table_like_mut())
-                        {
-                            if let Some(dep) = deps_mut.get_mut(crate_name) {
-                                if let Some(t) = dep.as_inline_table_mut() {
-                                    t.remove("git");
-                                    t.remove("branch");
-                                    t.remove("tag");
-                                    t.remove("rev");
-                                } else if let Some(t) = dep.as_table_mut() {
-                                    t.remove("git");
-                                    t.remove("branch");
-                                    t.remove("tag");
-                                    t.remove("rev");
-                                }
+                        strip_git_keys_from_dep(
+                            &mut doc,
+                            target_spec.as_deref(),
+                            section,
+                            crate_name,
+                        );
+                    }
+                    let did = match target_spec.as_deref() {
+                        None => {
+                            if manifest::set_dep_path(&mut doc, section, crate_name, &path) {
+                                manifest::set_dep_version(&mut doc, section, crate_name, "*");
+                                true
+                            } else {
+                                false
                             }
                         }
-                    }
-                    if manifest::set_dep_path(&mut doc, section, crate_name, &path) {
-                        manifest::set_dep_version(&mut doc, section, crate_name, "*");
+                        Some(spec) => {
+                            if manifest::set_target_dep_path(
+                                &mut doc, spec, section, crate_name, &path,
+                            ) {
+                                manifest::set_target_dep_version(
+                                    &mut doc, spec, section, crate_name, "*",
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if did {
                         changes += 1;
                     }
                 }
@@ -480,8 +582,8 @@ fn add_path_overrides_to_repo(
         let (_, mut doc) = manifest::read_manifest(manifest_path)?;
         let mut changes = 0;
 
-        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-            let Some(deps) = raw_doc.get(section).and_then(|d| d.as_table()) else {
+        for (target_spec, section) in dep_section_locations(&raw_doc) {
+            let Some(deps) = raw_dep_table(&raw_doc, target_spec.as_deref(), section) else {
                 continue;
             };
             let dep_names: Vec<String> = deps.keys().map(|k| k.to_string()).collect();
@@ -532,28 +634,37 @@ fn add_path_overrides_to_repo(
                 let path =
                     compute_dep_path(manifest_path, repo_dir, &dir, actual_name, crate_to_repo);
                 if let Some(path) = path {
-                    // Remove git key first if present, then add path
                     if has_git {
-                        if let Some(deps_mut) =
-                            doc.get_mut(section).and_then(|s| s.as_table_like_mut())
-                        {
-                            if let Some(dep) = deps_mut.get_mut(dep_name) {
-                                if let Some(t) = dep.as_inline_table_mut() {
-                                    t.remove("git");
-                                    t.remove("branch");
-                                    t.remove("tag");
-                                    t.remove("rev");
-                                } else if let Some(t) = dep.as_table_mut() {
-                                    t.remove("git");
-                                    t.remove("branch");
-                                    t.remove("tag");
-                                    t.remove("rev");
-                                }
+                        strip_git_keys_from_dep(
+                            &mut doc,
+                            target_spec.as_deref(),
+                            section,
+                            dep_name,
+                        );
+                    }
+                    let did = match target_spec.as_deref() {
+                        None => {
+                            if manifest::set_dep_path(&mut doc, section, dep_name, &path) {
+                                manifest::set_dep_version(&mut doc, section, dep_name, "*");
+                                true
+                            } else {
+                                false
                             }
                         }
-                    }
-                    if manifest::set_dep_path(&mut doc, section, dep_name, &path) {
-                        manifest::set_dep_version(&mut doc, section, dep_name, "*");
+                        Some(spec) => {
+                            if manifest::set_target_dep_path(
+                                &mut doc, spec, section, dep_name, &path,
+                            ) {
+                                manifest::set_target_dep_version(
+                                    &mut doc, spec, section, dep_name, "*",
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if did {
                         changes += 1;
                     }
                 }
