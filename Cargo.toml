@@ -7,6 +7,13 @@ license = "MIT"
 description = "Multi-repo Rust workspace manager — CI prep, dependency graphs, coordinated releases"
 repository = "https://github.com/imazen/cargo-superwork"
 
+exclude = [
+  ".github/",
+  ".gitignore",
+  ".workongoing",
+  ".jj/",
+]
+
 [[bin]]
 name = "cargo-superwork"
 path = "src/main.rs"
