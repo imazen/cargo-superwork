@@ -492,10 +492,20 @@ fn add_path_overrides(
                 let Some(deps) = raw_dep_table(&raw_doc, target_spec.as_deref(), section) else {
                     continue;
                 };
-                let dep_entry = deps.get(*crate_name).and_then(|d| d.as_table());
-                let Some(_) = dep_entry else {
+                // Bare-string entries (`dep = "1.0"`) are version-only deps —
+                // the primary rewrite target. Table entries get inspected for
+                // workspace/path/git keys below.
+                let Some(dep_value) = deps.get(*crate_name) else {
                     continue;
                 };
+                let dep_entry = dep_value.as_table();
+
+                // Skip `dep.workspace = true` entries: cargo forbids `path` /
+                // `version` on inherited deps. Their resolution point is the
+                // root [workspace.dependencies] table, handled below.
+                if dep_entry.is_some_and(|t| t.contains_key("workspace")) {
+                    continue;
+                }
 
                 // Skip deps with existing intra-workspace path (resolves within repo).
                 // Cross-repo paths (outside repo root) should be rewritten.
@@ -556,6 +566,46 @@ fn add_path_overrides(
             }
         }
 
+        // Also handle [workspace.dependencies]: member crates reference these
+        // via `dep.workspace = true`, so skipping them left the CI project
+        // itself on crates.io versions while every sibling clone got path
+        // overrides — split dependency graphs and E0277 trait mismatches
+        // across the boundary (zenpipe#39).
+        if let Some(ws_deps) = raw_doc
+            .get("workspace")
+            .and_then(|w| w.as_table())
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.as_table())
+        {
+            for crate_name in &crates_in_dir {
+                let Some(dep_value) = ws_deps.get(*crate_name) else {
+                    continue;
+                };
+                // Skip entries whose existing path resolves within this repo.
+                if let Some(existing_path) = dep_value.get("path").and_then(|p| p.as_str()) {
+                    if is_intra_repo_path(manifest_path, existing_path, project_dir) {
+                        continue;
+                    }
+                }
+                let Some(path) = compute_dep_path(
+                    manifest_path,
+                    project_dir,
+                    sibling_dir,
+                    crate_name,
+                    crate_to_repo,
+                ) else {
+                    continue;
+                };
+                if dep_value.get("git").is_some() {
+                    manifest::strip_ws_dep_git_keys(&mut doc, crate_name);
+                }
+                if manifest::set_ws_dep_path(&mut doc, crate_name, &path) {
+                    manifest::set_ws_dep_version(&mut doc, crate_name, "*");
+                    changes += 1;
+                }
+            }
+        }
+
         if changes > 0 {
             manifest::write_manifest(manifest_path, &doc, false)?;
             modified += 1;
@@ -589,7 +639,20 @@ fn add_path_overrides_to_repo(
             let dep_names: Vec<String> = deps.keys().map(|k| k.to_string()).collect();
 
             for dep_name in &dep_names {
-                let dep_entry = deps.get(dep_name).and_then(|d| d.as_table());
+                // Bare-string entries (`dep = "1.0"`) are version-only deps —
+                // the primary rewrite target. Table entries get inspected for
+                // workspace/path/git keys below.
+                let Some(dep_value) = deps.get(dep_name) else {
+                    continue;
+                };
+                let dep_entry = dep_value.as_table();
+
+                // Skip `dep.workspace = true` entries: cargo forbids `path` /
+                // `version` on inherited deps. Their resolution point is the
+                // root [workspace.dependencies] table, handled below.
+                if dep_entry.is_some_and(|t| t.contains_key("workspace")) {
+                    continue;
+                }
 
                 // Skip deps with existing intra-workspace path (resolves within repo).
                 // Cross-repo paths (outside repo root) should be rewritten.
@@ -672,71 +735,36 @@ fn add_path_overrides_to_repo(
         }
 
         // Also handle [workspace.dependencies]
-        if let Some(ws) = doc.get("workspace").and_then(|w| w.as_table()) {
-            if let Some(ws_deps) = ws.get("dependencies").and_then(|d| d.as_table()) {
-                let dep_names: Vec<String> = ws_deps.iter().map(|(k, _)| k.to_string()).collect();
-                for dep_name in &dep_names {
-                    if let Some((dir, _)) = crate_to_repo.get(dep_name.as_str()) {
-                        if available_dirs.contains(dir) {
-                            let path = compute_dep_path(
-                                manifest_path,
-                                repo_dir,
-                                dir,
-                                dep_name,
-                                crate_to_repo,
-                            );
-                            if let Some(ref path) = path {
-                                // For workspace deps, navigate manually
-                                if let Some(ws) =
-                                    doc.get_mut("workspace").and_then(|w| w.as_table_mut())
-                                {
-                                    if let Some(ws_deps) = ws
-                                        .get_mut("dependencies")
-                                        .and_then(|d| d.as_table_like_mut())
-                                    {
-                                        if let Some(dep) = ws_deps.get_mut(dep_name.as_str()) {
-                                            // Skip if existing path resolves within repo
-                                            let skip = dep
-                                                .as_inline_table()
-                                                .and_then(|t| t.get("path"))
-                                                .and_then(|v| v.as_str())
-                                                .or_else(|| {
-                                                    dep.as_table()
-                                                        .and_then(|t| t.get("path"))
-                                                        .and_then(|v| v.as_str())
-                                                })
-                                                .is_some_and(|p| {
-                                                    is_intra_repo_path(manifest_path, p, repo_dir)
-                                                });
-                                            if !skip {
-                                                if let Some(tbl) = dep.as_inline_table_mut() {
-                                                    // Remove git keys before adding path
-                                                    tbl.remove("git");
-                                                    tbl.remove("branch");
-                                                    tbl.remove("tag");
-                                                    tbl.remove("rev");
-                                                    tbl.insert("path", path.as_str().into());
-                                                    tbl.insert("version", "*".into());
-                                                    changes += 1;
-                                                } else if let Some(tbl) = dep.as_table_mut() {
-                                                    tbl.remove("git");
-                                                    tbl.remove("branch");
-                                                    tbl.remove("tag");
-                                                    tbl.remove("rev");
-                                                    tbl.insert(
-                                                        "path",
-                                                        toml_edit::value(path.as_str()),
-                                                    );
-                                                    tbl.insert("version", toml_edit::value("*"));
-                                                    changes += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        if let Some(ws_deps) = raw_doc
+            .get("workspace")
+            .and_then(|w| w.as_table())
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.as_table())
+        {
+            for (dep_name, dep_value) in ws_deps {
+                let Some((dir, _)) = crate_to_repo.get(dep_name.as_str()) else {
+                    continue;
+                };
+                if !available_dirs.contains(dir) {
+                    continue;
+                }
+                // Skip entries whose existing path resolves within this repo.
+                if let Some(existing_path) = dep_value.get("path").and_then(|p| p.as_str()) {
+                    if is_intra_repo_path(manifest_path, existing_path, repo_dir) {
+                        continue;
                     }
+                }
+                let Some(path) =
+                    compute_dep_path(manifest_path, repo_dir, dir, dep_name, crate_to_repo)
+                else {
+                    continue;
+                };
+                if dep_value.get("git").is_some() {
+                    manifest::strip_ws_dep_git_keys(&mut doc, dep_name);
+                }
+                if manifest::set_ws_dep_path(&mut doc, dep_name, &path) {
+                    manifest::set_ws_dep_version(&mut doc, dep_name, "*");
+                    changes += 1;
                 }
             }
         }
@@ -1171,4 +1199,191 @@ fn find_repo_url(dir: &str, config: &SuperworkConfig) -> Option<String> {
         config.meta().default_github_org,
         dir
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn repo_map(entries: &[(&str, &str)]) -> BTreeMap<String, (String, String)> {
+        entries
+            .iter()
+            .map(|(name, dir)| {
+                (
+                    name.to_string(),
+                    (dir.to_string(), format!("https://github.com/imazen/{dir}")),
+                )
+            })
+            .collect()
+    }
+
+    /// zenpipe#39: `[workspace.dependencies]` entries in the CI project itself
+    /// must get path overrides. Member crates consume them via
+    /// `dep.workspace = true`; missing them splits the dependency graph
+    /// between the crates.io version (project) and the sibling clone (every
+    /// other repo), producing E0277 trait mismatches across the boundary.
+    #[test]
+    fn add_paths_rewrites_cwd_workspace_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path();
+        let project = parent.join("project");
+
+        write(
+            &project.join("Cargo.toml"),
+            r#"[workspace]
+members = ["member", "direct"]
+
+[workspace.dependencies]
+enough = { version = "0.4", default-features = false }
+whereat = "0.1.5"
+"#,
+        );
+        write(
+            &project.join("member/Cargo.toml"),
+            r#"[package]
+name = "member-crate"
+version = "0.1.0"
+
+[dependencies]
+enough.workspace = true
+whereat.workspace = true
+"#,
+        );
+        // Second member with direct (non-inherited) deps: a bare-string
+        // version dep and an expanded table dep.
+        write(
+            &project.join("direct/Cargo.toml"),
+            r#"[package]
+name = "direct-crate"
+version = "0.1.0"
+
+[dependencies]
+enough = "0.4"
+whereat = { version = "0.1.4", default-features = false }
+"#,
+        );
+        write(
+            &parent.join("enough/Cargo.toml"),
+            "[package]\nname = \"enough\"\nversion = \"0.4.4\"\n",
+        );
+        write(
+            &parent.join("whereat/Cargo.toml"),
+            "[package]\nname = \"whereat\"\nversion = \"0.1.5\"\n",
+        );
+
+        let map = repo_map(&[("enough", "enough"), ("whereat", "whereat")]);
+        for dir in ["enough", "whereat"] {
+            add_path_overrides(&project, dir, &map).unwrap();
+        }
+
+        let rewritten = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        let doc: toml::Value = toml::from_str(&rewritten).unwrap();
+        let ws_deps = doc["workspace"]["dependencies"].as_table().unwrap();
+
+        let enough = ws_deps["enough"].as_table().unwrap();
+        assert_eq!(
+            enough.get("path").and_then(|p| p.as_str()),
+            Some("../enough")
+        );
+        assert_eq!(enough.get("version").and_then(|v| v.as_str()), Some("*"));
+        assert_eq!(
+            enough.get("default-features").and_then(|d| d.as_bool()),
+            Some(false),
+            "unrelated keys preserved"
+        );
+
+        // Bare-string entries are converted to inline tables with a path.
+        let whereat = ws_deps["whereat"].as_table().unwrap();
+        assert_eq!(
+            whereat.get("path").and_then(|p| p.as_str()),
+            Some("../whereat")
+        );
+
+        // Member `dep.workspace = true` entries must never gain a `path` —
+        // cargo rejects `workspace = true` combined with `path`.
+        let member = std::fs::read_to_string(project.join("member/Cargo.toml")).unwrap();
+        let member_doc: toml::Value = toml::from_str(&member).unwrap();
+        for dep in ["enough", "whereat"] {
+            let entry = member_doc["dependencies"][dep].as_table().unwrap();
+            assert_eq!(
+                entry.get("workspace").and_then(|w| w.as_bool()),
+                Some(true),
+                "{dep}: workspace=true preserved"
+            );
+            assert!(
+                entry.get("path").is_none(),
+                "{dep}: member entry must not gain a path: {member}"
+            );
+        }
+
+        // Direct member deps DO get paths — including bare-string version
+        // deps (`enough = "0.4"`), which a registry/path split would
+        // otherwise leave on crates.io (zenpipe#39, zencodecs case).
+        let direct = std::fs::read_to_string(project.join("direct/Cargo.toml")).unwrap();
+        let direct_doc: toml::Value = toml::from_str(&direct).unwrap();
+        for dep in ["enough", "whereat"] {
+            let entry = direct_doc["dependencies"][dep].as_table().unwrap();
+            assert_eq!(
+                entry.get("path").and_then(|p| p.as_str()),
+                Some(format!("../../{dep}").as_str()),
+                "{dep}: direct member dep pathed: {direct}"
+            );
+            assert_eq!(
+                entry.get("version").and_then(|v| v.as_str()),
+                Some("*"),
+                "{dep}: direct member dep wildcarded"
+            );
+        }
+    }
+
+    /// Intra-workspace path entries (crates within the same repo) are left
+    /// alone — only crates.io / cross-repo deps get sibling paths.
+    #[test]
+    fn add_paths_skips_intra_repo_workspace_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path();
+        let project = parent.join("project");
+
+        write(
+            &project.join("Cargo.toml"),
+            r#"[workspace]
+members = ["inner"]
+
+[workspace.dependencies]
+inner-crate = { version = "0.1.0", path = "inner" }
+"#,
+        );
+        write(
+            &project.join("inner/Cargo.toml"),
+            "[package]\nname = \"inner-crate\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            &parent.join("inner-crate/Cargo.toml"),
+            "[package]\nname = \"inner-crate\"\nversion = \"0.1.0\"\n",
+        );
+
+        let map = repo_map(&[("inner-crate", "inner-crate")]);
+        add_path_overrides(&project, "inner-crate", &map).unwrap();
+
+        let rewritten = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        let doc: toml::Value = toml::from_str(&rewritten).unwrap();
+        let entry = doc["workspace"]["dependencies"]["inner-crate"]
+            .as_table()
+            .unwrap();
+        assert_eq!(
+            entry.get("path").and_then(|p| p.as_str()),
+            Some("inner"),
+            "intra-repo path preserved"
+        );
+        assert_eq!(
+            entry.get("version").and_then(|v| v.as_str()),
+            Some("0.1.0"),
+            "intra-repo version preserved"
+        );
+    }
 }

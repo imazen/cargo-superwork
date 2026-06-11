@@ -252,13 +252,7 @@ pub fn remove_workspace_member(doc: &mut DocumentMut, member: &str) -> bool {
 /// Remove a key from [workspace.dependencies].
 /// Returns true if the key was found and removed.
 pub fn remove_workspace_dep(doc: &mut DocumentMut, dep_name: &str) -> bool {
-    let Some(workspace) = doc.get_mut("workspace").and_then(|w| w.as_table_mut()) else {
-        return false;
-    };
-    let Some(deps) = workspace
-        .get_mut("dependencies")
-        .and_then(|d| d.as_table_like_mut())
-    else {
+    let Some(deps) = ws_deps_table_mut(doc) else {
         return false;
     };
     if deps.contains_key(dep_name) {
@@ -266,6 +260,52 @@ pub fn remove_workspace_dep(doc: &mut DocumentMut, dep_name: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Navigate to the mutable `[workspace.dependencies]` table, if present.
+fn ws_deps_table_mut(doc: &mut DocumentMut) -> Option<&mut dyn toml_edit::TableLike> {
+    doc.get_mut("workspace")
+        .and_then(|w| w.as_table_like_mut())?
+        .get_mut("dependencies")
+        .and_then(|d| d.as_table_like_mut())
+}
+
+/// Like [`set_dep_path`] but for `[workspace.dependencies]`.
+/// Returns true if a change was made.
+pub fn set_ws_dep_path(doc: &mut DocumentMut, dep_name: &str, path: &str) -> bool {
+    let Some(deps) = ws_deps_table_mut(doc) else {
+        return false;
+    };
+    set_path_on_deps_table(deps, dep_name, path)
+}
+
+/// Like [`set_dep_version`] but for `[workspace.dependencies]`.
+/// Returns true if a change was made.
+pub fn set_ws_dep_version(doc: &mut DocumentMut, dep_name: &str, version: &str) -> bool {
+    let Some(deps) = ws_deps_table_mut(doc) else {
+        return false;
+    };
+    set_version_on_deps_table(deps, dep_name, version)
+}
+
+/// Strip git-source keys (`git`, `branch`, `tag`, `rev`) from a
+/// `[workspace.dependencies]` entry, ahead of adding a path override.
+pub fn strip_ws_dep_git_keys(doc: &mut DocumentMut, dep_name: &str) {
+    let Some(deps) = ws_deps_table_mut(doc) else {
+        return;
+    };
+    let Some(dep) = deps.get_mut(dep_name) else {
+        return;
+    };
+    if let Some(tbl) = dep.as_inline_table_mut() {
+        for key in ["git", "branch", "tag", "rev"] {
+            tbl.remove(key);
+        }
+    } else if let Some(tbl) = dep.as_table_mut() {
+        for key in ["git", "branch", "tag", "rev"] {
+            tbl.remove(key);
+        }
+    }
 }
 
 /// Strip a specific feature from a dependency's features list.
