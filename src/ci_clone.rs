@@ -49,7 +49,8 @@ pub fn run(
 
     // Phase 1: find which sibling dirs we need from the CWD project's deps.
     let mut needed_dirs: BTreeSet<String> = BTreeSet::new();
-    collect_needed_dirs(&cwd, &crate_to_repo, &mut needed_dirs)?;
+    let owned_orgs = config.owned_orgs();
+    collect_needed_dirs(&cwd, &crate_to_repo, &owned_orgs, &mut needed_dirs)?;
 
     // Remove excluded dirs (provided by existing path deps)
     for dir in &excluded_dirs {
@@ -123,7 +124,7 @@ pub fn run(
 
             // If --recursive, scan the cloned repo for its own deps and add to needed_dirs.
             if recursive && target.exists() {
-                collect_needed_dirs(&target, &crate_to_repo, &mut needed_dirs)?;
+                collect_needed_dirs(&target, &crate_to_repo, &owned_orgs, &mut needed_dirs)?;
                 // Re-apply exclusions after each expansion
                 for excl in &excluded_dirs {
                     needed_dirs.remove(excl);
@@ -277,6 +278,7 @@ fn crates_provided_by_repo(repo_dir: &Path) -> BTreeSet<String> {
 fn collect_needed_dirs(
     repo_dir: &Path,
     crate_to_repo: &BTreeMap<String, (String, String)>,
+    owned_orgs: &[&str],
     needed_dirs: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     // Find all Cargo.toml files in this repo
@@ -305,11 +307,7 @@ fn collect_needed_dirs(
                 // (Git deps don't compose well — fetched repos have their own
                 // path deps that don't exist in CI.)
                 if let Some(git_url) = tbl.and_then(|t| t.get("git")).and_then(|g| g.as_str()) {
-                    if let Some(dir) = git_url
-                        .strip_prefix("https://github.com/")
-                        .and_then(|s| s.split('/').nth(1))
-                        .map(|s| s.trim_end_matches(".git").to_string())
-                    {
+                    if let Some(dir) = owned_git_dep_dir(git_url, owned_orgs) {
                         needed_dirs.insert(dir);
                     }
                     continue;
@@ -1169,6 +1167,21 @@ fn extract_sibling_dir(path: &str) -> Option<String> {
 }
 
 /// Find the git URL for a sibling directory name.
+/// The sibling directory to clone for a git dependency, when it is hosted
+/// by one of the owned orgs. A git dependency elsewhere (an upstream repo a
+/// crate benchmarks against, say) is left alone: cargo fetches it at its
+/// pinned rev, and cloning it by name under the default org would ask for a
+/// repo that does not exist (`image-rs/image-png` became `imazen/image-png`).
+fn owned_git_dep_dir(git_url: &str, owned_orgs: &[&str]) -> Option<String> {
+    let mut parts = git_url.strip_prefix("https://github.com/")?.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?.trim_end_matches(".git");
+    owned_orgs
+        .iter()
+        .any(|org| org.eq_ignore_ascii_case(owner))
+        .then(|| repo.to_string())
+}
+
 fn find_repo_url(dir: &str, config: &SuperworkConfig) -> Option<String> {
     // Check [[repo]] overrides
     for r in &config.repo {
@@ -1227,6 +1240,24 @@ mod tests {
     /// `dep.workspace = true`; missing them splits the dependency graph
     /// between the crates.io version (project) and the sibling clone (every
     /// other repo), producing E0277 trait mismatches across the boundary.
+    #[test]
+    fn git_deps_outside_owned_orgs_are_not_cloned() {
+        let owned = ["imazen", "lilith"];
+        assert_eq!(
+            owned_git_dep_dir("https://github.com/imazen/zenpng", &owned).as_deref(),
+            Some("zenpng")
+        );
+        assert_eq!(
+            owned_git_dep_dir("https://github.com/lilith/image-tiff.git", &owned).as_deref(),
+            Some("image-tiff")
+        );
+        assert_eq!(
+            owned_git_dep_dir("https://github.com/image-rs/image-png", &owned),
+            None
+        );
+        assert_eq!(owned_git_dep_dir("https://gitlab.com/x/y", &owned), None);
+    }
+
     #[test]
     fn add_paths_rewrites_cwd_workspace_dependencies() {
         let tmp = tempfile::tempdir().unwrap();
