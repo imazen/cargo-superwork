@@ -538,7 +538,7 @@ fn add_path_overrides(
                     let did = match target_spec.as_deref() {
                         None => {
                             if manifest::set_dep_path(&mut doc, section, crate_name, &path) {
-                                manifest::set_dep_version(&mut doc, section, crate_name, "*");
+                                manifest::clear_dep_version(&mut doc, section, crate_name);
                                 true
                             } else {
                                 false
@@ -548,8 +548,8 @@ fn add_path_overrides(
                             if manifest::set_target_dep_path(
                                 &mut doc, spec, section, crate_name, &path,
                             ) {
-                                manifest::set_target_dep_version(
-                                    &mut doc, spec, section, crate_name, "*",
+                                manifest::clear_target_dep_version(
+                                    &mut doc, spec, section, crate_name,
                                 );
                                 true
                             } else {
@@ -598,7 +598,7 @@ fn add_path_overrides(
                     manifest::strip_ws_dep_git_keys(&mut doc, crate_name);
                 }
                 if manifest::set_ws_dep_path(&mut doc, crate_name, &path) {
-                    manifest::set_ws_dep_version(&mut doc, crate_name, "*");
+                    manifest::clear_ws_dep_version(&mut doc, crate_name);
                     changes += 1;
                 }
             }
@@ -706,7 +706,7 @@ fn add_path_overrides_to_repo(
                     let did = match target_spec.as_deref() {
                         None => {
                             if manifest::set_dep_path(&mut doc, section, dep_name, &path) {
-                                manifest::set_dep_version(&mut doc, section, dep_name, "*");
+                                manifest::clear_dep_version(&mut doc, section, dep_name);
                                 true
                             } else {
                                 false
@@ -716,8 +716,8 @@ fn add_path_overrides_to_repo(
                             if manifest::set_target_dep_path(
                                 &mut doc, spec, section, dep_name, &path,
                             ) {
-                                manifest::set_target_dep_version(
-                                    &mut doc, spec, section, dep_name, "*",
+                                manifest::clear_target_dep_version(
+                                    &mut doc, spec, section, dep_name,
                                 );
                                 true
                             } else {
@@ -761,7 +761,7 @@ fn add_path_overrides_to_repo(
                     manifest::strip_ws_dep_git_keys(&mut doc, dep_name);
                 }
                 if manifest::set_ws_dep_path(&mut doc, dep_name, &path) {
-                    manifest::set_ws_dep_version(&mut doc, dep_name, "*");
+                    manifest::clear_ws_dep_version(&mut doc, dep_name);
                     changes += 1;
                 }
             }
@@ -982,9 +982,9 @@ fn delete_deps_from_project(project_dir: &Path, deps_to_delete: &[String]) -> Re
     Ok(())
 }
 
-/// Set version = "*" on all deps that have a path key.
-/// This prevents version mismatch errors between Cargo.toml declarations
-/// and actual cloned repo versions.
+/// Drop the version requirement from every cross-repo path dep, so the
+/// cloned sibling's version always matches. (`version = "*"` would not
+/// match a sibling on a prerelease such as archmage `0.9.31-beta.1`.)
 fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
     let manifests = find_manifests(repo_dir);
 
@@ -1011,7 +1011,7 @@ fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
                     dep_path.is_some_and(|p| !is_intra_repo_path(manifest_path, p, repo_dir));
                 if is_cross_repo
                     && has_version
-                    && manifest::set_dep_version(&mut doc, section, name, "*")
+                    && manifest::clear_dep_version(&mut doc, section, name)
                 {
                     changes += 1;
                 }
@@ -1034,28 +1034,8 @@ fn wildcard_all_path_dep_versions(repo_dir: &Path) -> Result<(), String> {
                 // Only wildcard cross-repo path deps; preserve intra-workspace versions.
                 let is_cross_repo =
                     dep_path.is_some_and(|p| !is_intra_repo_path(manifest_path, p, repo_dir));
-                if is_cross_repo && has_version {
-                    // Navigate workspace.dependencies manually for toml_edit
-                    if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_mut()) {
-                        if let Some(ws_deps) = ws
-                            .get_mut("dependencies")
-                            .and_then(|d| d.as_table_like_mut())
-                        {
-                            if let Some(dep) = ws_deps.get_mut(name) {
-                                if let Some(tbl) = dep.as_inline_table_mut() {
-                                    if tbl.get("version").and_then(|v| v.as_str()) != Some("*") {
-                                        tbl.insert("version", "*".into());
-                                        changes += 1;
-                                    }
-                                } else if let Some(tbl) = dep.as_table_mut() {
-                                    if tbl.get("version").and_then(|v| v.as_str()) != Some("*") {
-                                        tbl.insert("version", toml_edit::value("*"));
-                                        changes += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if is_cross_repo && has_version && manifest::clear_ws_dep_version(&mut doc, name) {
+                    changes += 1;
                 }
             }
         }
@@ -1321,7 +1301,10 @@ whereat = { version = "0.1.4", default-features = false }
             enough.get("path").and_then(|p| p.as_str()),
             Some("../enough")
         );
-        assert_eq!(enough.get("version").and_then(|v| v.as_str()), Some("*"));
+        assert!(
+            enough.get("version").is_none(),
+            "path overrides carry no version requirement"
+        );
         assert_eq!(
             enough.get("default-features").and_then(|d| d.as_bool()),
             Some(false),
@@ -1364,12 +1347,51 @@ whereat = { version = "0.1.4", default-features = false }
                 Some(format!("../../{dep}").as_str()),
                 "{dep}: direct member dep pathed: {direct}"
             );
-            assert_eq!(
-                entry.get("version").and_then(|v| v.as_str()),
-                Some("*"),
-                "{dep}: direct member dep wildcarded"
+            assert!(
+                entry.get("version").is_none(),
+                "{dep}: direct member dep has no version requirement: {direct}"
             );
         }
+    }
+
+    /// A sibling on a prerelease (archmage `0.9.31-beta.1`) still resolves:
+    /// `version = "*"` rejected it and failed every zen repo's CI.
+    #[test]
+    fn prerelease_sibling_resolves_through_the_path_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path();
+        let project = parent.join("proj");
+        write(
+            &project.join("Cargo.toml"),
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\narchmage = { version = \"0.9.30\", default-features = false }\n",
+        );
+        write(&project.join("src/lib.rs"), "");
+        write(
+            &parent.join("archmage/Cargo.toml"),
+            "[package]\nname = \"archmage\"\nversion = \"0.9.31-beta.1\"\nedition = \"2021\"\n",
+        );
+        write(&parent.join("archmage/src/lib.rs"), "");
+        let map = repo_map(&[("archmage", "archmage")]);
+        add_path_overrides(&project, "archmage", &map).unwrap();
+        let rewritten = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        let doc: toml::Value = toml::from_str(&rewritten).unwrap();
+        let dep = doc["dependencies"]["archmage"].as_table().unwrap();
+        assert_eq!(
+            dep.get("path").and_then(|p| p.as_str()),
+            Some("../archmage")
+        );
+        assert!(dep.get("version").is_none(), "{rewritten}");
+        let out = std::process::Command::new(env!("CARGO"))
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cargo resolves the prerelease sibling: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Intra-workspace path entries (crates within the same repo) are left

@@ -279,15 +279,6 @@ pub fn set_ws_dep_path(doc: &mut DocumentMut, dep_name: &str, path: &str) -> boo
     set_path_on_deps_table(deps, dep_name, path)
 }
 
-/// Like [`set_dep_version`] but for `[workspace.dependencies]`.
-/// Returns true if a change was made.
-pub fn set_ws_dep_version(doc: &mut DocumentMut, dep_name: &str, version: &str) -> bool {
-    let Some(deps) = ws_deps_table_mut(doc) else {
-        return false;
-    };
-    set_version_on_deps_table(deps, dep_name, version)
-}
-
 /// Strip git-source keys (`git`, `branch`, `tag`, `rev`) from a
 /// `[workspace.dependencies]` entry, ahead of adding a path override.
 pub fn strip_ws_dep_git_keys(doc: &mut DocumentMut, dep_name: &str) {
@@ -432,6 +423,57 @@ fn set_version_on_deps_table(
     false
 }
 
+/// Remove the `version` requirement from a dependency entry, so a path
+/// override accepts whatever version the checkout carries. `version = "*"`
+/// is not equivalent: it never matches a prerelease such as `0.9.31-beta.1`.
+pub fn clear_dep_version(doc: &mut DocumentMut, section: &str, dep_name: &str) -> bool {
+    let Some(deps) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) else {
+        return false;
+    };
+    clear_version_on_deps_table(deps, dep_name)
+}
+
+/// Like [`clear_dep_version`] but for `[target.<spec>.<section>]` sections.
+pub fn clear_target_dep_version(
+    doc: &mut DocumentMut,
+    target_spec: &str,
+    section: &str,
+    dep_name: &str,
+) -> bool {
+    let Some(deps) = doc
+        .get_mut("target")
+        .and_then(|t| t.as_table_like_mut())
+        .and_then(|t| t.get_mut(target_spec))
+        .and_then(|t| t.as_table_like_mut())
+        .and_then(|t| t.get_mut(section))
+        .and_then(|s| s.as_table_like_mut())
+    else {
+        return false;
+    };
+    clear_version_on_deps_table(deps, dep_name)
+}
+
+/// Like [`clear_dep_version`] but for `[workspace.dependencies]`.
+pub fn clear_ws_dep_version(doc: &mut DocumentMut, dep_name: &str) -> bool {
+    let Some(deps) = ws_deps_table_mut(doc) else {
+        return false;
+    };
+    clear_version_on_deps_table(deps, dep_name)
+}
+
+fn clear_version_on_deps_table(deps: &mut dyn toml_edit::TableLike, dep_name: &str) -> bool {
+    let Some(dep) = deps.get_mut(dep_name) else {
+        return false;
+    };
+    if let Some(tbl) = dep.as_inline_table_mut() {
+        tbl.remove("version").is_some()
+    } else if let Some(tbl) = dep.as_table_mut() {
+        tbl.remove("version").is_some()
+    } else {
+        false
+    }
+}
+
 /// Update the version in a dependency entry (in any section).
 pub fn set_dep_version(
     doc: &mut DocumentMut,
@@ -440,32 +482,6 @@ pub fn set_dep_version(
     version: &str,
 ) -> bool {
     let Some(deps) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) else {
-        return false;
-    };
-    set_version_on_deps_table(deps, dep_name, version)
-}
-
-/// Like [`set_dep_version`] but for `[target.<spec>.<section>]` sections.
-pub fn set_target_dep_version(
-    doc: &mut DocumentMut,
-    target_spec: &str,
-    section: &str,
-    dep_name: &str,
-    version: &str,
-) -> bool {
-    let Some(target) = doc.get_mut("target").and_then(|t| t.as_table_like_mut()) else {
-        return false;
-    };
-    let Some(target_entry) = target
-        .get_mut(target_spec)
-        .and_then(|t| t.as_table_like_mut())
-    else {
-        return false;
-    };
-    let Some(deps) = target_entry
-        .get_mut(section)
-        .and_then(|s| s.as_table_like_mut())
-    else {
         return false;
     };
     set_version_on_deps_table(deps, dep_name, version)

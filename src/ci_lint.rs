@@ -168,7 +168,7 @@ fn build_report(
         }
 
         // Sort: errors first, then warnings, then info, then pass
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+        findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
         repos.push(RepoReport {
             repo_dir: repo_dir.clone(),

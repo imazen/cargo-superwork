@@ -785,7 +785,7 @@ pub fn run(ecosystem_root: &Path, config: &SuperworkConfig) -> Result<(), String
         *dep_counts.entry(&dep.to_crate).or_default() += 1;
     }
     let mut sorted: Vec<_> = dep_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     println!();
     println!("=== Most Depended-On ===");
