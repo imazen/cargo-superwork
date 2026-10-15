@@ -884,15 +884,19 @@ fn pathdiff(from: &Path, to: &Path) -> String {
         .take_while(|(a, b)| a == b)
         .count();
 
+    // Joined with `/`, not the OS separator: the result goes into a
+    // Cargo.toml, which takes forward slashes on every platform (a PathBuf
+    // gave `..\\enough` on Windows).
     let ups = from_parts.len() - common;
-    let mut result = PathBuf::new();
-    for _ in 0..ups {
-        result.push("..");
-    }
+    let mut parts: Vec<String> = vec!["..".to_string(); ups];
     for part in &to_parts[common..] {
-        result.push(part);
+        parts.push(part.as_os_str().to_string_lossy().into_owned());
     }
-    result.to_string_lossy().to_string()
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
 }
 
 /// Read the delete list from [package.metadata.superwork.ci] or [workspace.metadata.superwork.ci].
